@@ -1,26 +1,30 @@
 #!/usr/bin/env python3
 """
-Screenshot input for Claude Code on remote servers.
-Captures locally, transfers to remote, sends image path to tmux.
+Screenshot input for Claude Code — clipboard monitoring approach.
 
-Hotkeys:
-  Linux:  PrintScreen = full screen, Right Ctrl = region
-  macOS:  Ctrl+Shift+3 = full screen, Ctrl+Shift+4 = region
+Monitors the system clipboard for new screenshots. When detected:
+  - Saves the image to a local temp directory
+  - Local mode: puts the file path on clipboard for easy paste into Claude Code
+  - WSL mode: copies to WSL filesystem and sends path to tmux
+  - Remote mode: SCP to remote server and sends path to tmux
 
-Modes:
-  1. Single-host:  --host user@remote-ip
-  2. Multi-host:   --hosts user@ip1,user@ip2  (auto-detect from window)
-  3. Full auto:    --auto  (scan all SSH connections)
+Works with ANY screenshot tool — Win+Shift+S, Cmd+Shift+4, Flameshot, etc.
 
-Supports: Linux (evdev + maim/scrot) and macOS (pynput + screencapture)
+Usage:
+  claude-screenshot                              # local mode (Windows/macOS)
+  claude-screenshot --wsl                        # send to Claude Code in WSL
+  claude-screenshot --host user@remote-ip        # send to remote server
+  claude-screenshot --hosts user@ip1,user@ip2    # multi-host auto-detect
+  claude-screenshot --auto                       # auto-detect SSH connections
 """
 
 import os
 import platform
 import subprocess
-import threading
+import hashlib
 import time
 import argparse
+import threading
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -32,246 +36,145 @@ from shared.ssh_remote import (
 )
 
 IS_MAC = platform.system() == "Darwin"
+IS_WIN = platform.system() == "Windows"
+IS_LINUX = platform.system() == "Linux"
 
 args = None
 screenshot_counter = 0
-lock = threading.Lock()
+last_image_hash = None
 
 
-# ── Auto-detect SSH host from focused window ──
+# ── Clipboard image detection ──
 
-def get_focused_window_pid():
-    """Get the PID of the currently focused window."""
-    if IS_MAC:
-        # macOS: use AppleScript to get frontmost app PID
-        try:
-            ret = subprocess.run(
-                ["osascript", "-e",
-                 'tell application "System Events" to get unix id of first process whose frontmost is true'],
-                capture_output=True, text=True, timeout=3,
-            )
-            if ret.returncode == 0 and ret.stdout.strip():
-                return int(ret.stdout.strip())
-        except Exception:
-            pass
-        return None
-
-    # Linux: xdotool
+def get_clipboard_image():
+    """Get image from clipboard. Returns PIL Image or None."""
     try:
-        wid = subprocess.run(
-            ["xdotool", "getactivewindow"],
-            capture_output=True, text=True, timeout=3,
-        )
-        if wid.returncode != 0:
-            return None
-        window_id = wid.stdout.strip()
-
-        pid_ret = subprocess.run(
-            ["xdotool", "getwindowpid", window_id],
-            capture_output=True, text=True, timeout=3,
-        )
-        if pid_ret.returncode != 0:
-            return None
-        return int(pid_ret.stdout.strip())
-    except Exception:
-        return None
-
-
-def get_child_pids(pid):
-    """Recursively get all child PIDs of a process."""
-    try:
-        ret = subprocess.run(
-            ["pgrep", "-P", str(pid)],
-            capture_output=True, text=True, timeout=3,
-        )
-        children = [int(p) for p in ret.stdout.strip().splitlines() if p]
-        all_children = list(children)
-        for child in children:
-            all_children.extend(get_child_pids(child))
-        return all_children
-    except Exception:
-        return []
-
-
-def get_ssh_host_from_pid(pid):
-    """Extract the SSH destination host from a process's cmdline."""
-    try:
-        if IS_MAC:
-            # macOS: use ps to get command line
-            ret = subprocess.run(
-                ["ps", "-o", "args=", "-p", str(pid)],
-                capture_output=True, text=True, timeout=3,
-            )
-            if ret.returncode != 0 or not ret.stdout.strip():
-                return None
-            cmdline = ret.stdout.strip().split()
-        else:
-            # Linux: read /proc
-            cmdline_path = f"/proc/{pid}/cmdline"
-            if not os.path.exists(cmdline_path):
-                return None
-            with open(cmdline_path, "rb") as f:
-                cmdline = f.read().decode("utf-8", errors="replace").split("\x00")
-
-        if not cmdline or "ssh" not in os.path.basename(cmdline[0]):
-            return None
-
-        skip_next = False
-        for arg in cmdline[1:]:
-            if skip_next:
-                skip_next = False
-                continue
-            if arg.startswith("-"):
-                if arg in ("-p", "-l", "-i", "-o", "-F", "-J", "-L", "-R", "-D",
-                           "-W", "-w", "-E", "-S", "-b", "-c", "-m", "-O"):
-                    skip_next = True
-                continue
-            if arg and not arg.startswith("-"):
-                return arg
+        from PIL import ImageGrab
+        img = ImageGrab.grabclipboard()
+        if img is not None and hasattr(img, 'tobytes'):
+            return img
     except Exception:
         pass
+
+    # Linux fallback: xclip
+    if IS_LINUX:
+        try:
+            ret = subprocess.run(
+                ["xclip", "-selection", "clipboard", "-t", "image/png", "-o"],
+                capture_output=True, timeout=3,
+            )
+            if ret.returncode == 0 and ret.stdout:
+                from PIL import Image
+                import io
+                return Image.open(io.BytesIO(ret.stdout))
+        except Exception:
+            pass
+
     return None
 
 
-def detect_active_host():
-    """Detect which SSH host the focused terminal is connected to."""
-    window_pid = get_focused_window_pid()
-    if not window_pid:
-        print("  Could not detect focused window PID.", flush=True)
-        return None
-
-    all_pids = [window_pid] + get_child_pids(window_pid)
-
-    found_hosts = []
-    for pid in all_pids:
-        host = get_ssh_host_from_pid(pid)
-        if host:
-            found_hosts.append(host)
-
-    if not found_hosts:
-        print("  No SSH connection found in active window.", flush=True)
-        return None
-
-    if args.hosts:
-        allowed = set(args.hosts)
-        for h in found_hosts:
-            if h in allowed:
-                return h
-            bare = h.split("@")[-1] if "@" in h else h
-            for a in allowed:
-                a_bare = a.split("@")[-1] if "@" in a else a
-                if bare == a_bare:
-                    return a
-        print(f"  SSH host(s) {found_hosts} not in allowed list {args.hosts}", flush=True)
-        return None
-
-    return found_hosts[-1]
+def image_hash(img):
+    """Get a hash of a PIL Image to detect changes."""
+    return hashlib.md5(img.tobytes()).hexdigest()
 
 
-def detect_all_ssh_hosts():
-    """Scan all active SSH connections on the system."""
-    hosts = set()
-    try:
-        ret = subprocess.run(
-            ["pgrep", "-a", "ssh"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in ret.stdout.strip().splitlines():
-            parts = line.split(None, 1)
-            if len(parts) < 2:
-                continue
-            pid = int(parts[0])
-            host = get_ssh_host_from_pid(pid)
-            if host:
-                hosts.add(host)
-    except Exception:
-        pass
-    return list(hosts)
+# ── Save and transfer ──
 
-
-# ── Screenshot capture ──
-
-def take_screenshot(region=False):
-    """Take a screenshot locally. Returns the local file path or None."""
+def save_screenshot(img):
+    """Save PIL Image to local temp dir. Returns file path."""
     global screenshot_counter
-    with lock:
-        screenshot_counter += 1
-        count = screenshot_counter
+    screenshot_counter += 1
 
+    os.makedirs(SCREENSHOT_LOCAL_DIR, exist_ok=True)
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    filename = f"screenshot_{timestamp}_{count}.png"
+    filename = f"screenshot_{timestamp}_{screenshot_counter}.png"
     local_path = os.path.join(SCREENSHOT_LOCAL_DIR, filename)
 
-    print(f"\n  Capturing {'region' if region else 'full screen'}...", flush=True)
+    img.save(local_path, "PNG")
+    size_kb = os.path.getsize(local_path) / 1024
+    print(f"  Saved: {filename} ({size_kb:.0f} KB)", flush=True)
+    return local_path
 
+
+def handle_local(local_path):
+    """Local mode: put file path on clipboard so user can Ctrl+V into Claude Code."""
     try:
-        if IS_MAC:
-            # macOS: screencapture (built-in)
-            if region:
-                ret = subprocess.run(["screencapture", "-i", local_path], capture_output=True, text=True, timeout=30)
-            else:
-                ret = subprocess.run(["screencapture", local_path], capture_output=True, text=True, timeout=10)
-        else:
-            # Linux: maim or scrot
-            if region:
-                ret = subprocess.run(["maim", "-s", local_path], capture_output=True, text=True, timeout=30)
-            else:
-                ret = subprocess.run(["maim", local_path], capture_output=True, text=True, timeout=10)
-
-            if ret.returncode != 0:
-                print("  maim failed, trying scrot...", flush=True)
-                if region:
-                    ret = subprocess.run(["scrot", "-s", local_path], capture_output=True, text=True, timeout=30)
-                else:
-                    ret = subprocess.run(["scrot", local_path], capture_output=True, text=True, timeout=10)
-
-        if ret.returncode != 0:
-            print(f"  ERROR: Screenshot capture failed: {ret.stderr}", flush=True)
-            return None
-
-        if not os.path.exists(local_path):
-            print("  ERROR: Screenshot file not created.", flush=True)
-            return None
-
-        size_kb = os.path.getsize(local_path) / 1024
-        print(f"  Captured: {filename} ({size_kb:.0f} KB)", flush=True)
-        return local_path
-
-    except subprocess.TimeoutExpired:
-        print("  ERROR: Screenshot capture timed out.", flush=True)
-        return None
-    except Exception as e:
-        print(f"  ERROR: {e}", flush=True)
-        return None
+        import pyperclip
+        pyperclip.copy(local_path)
+        print(f"  File path copied to clipboard!", flush=True)
+        print(f"  Paste (Ctrl+V) into Claude Code to include the image.", flush=True)
+    except ImportError:
+        print(f"  Path: {local_path}", flush=True)
+        print(f"  (install pyperclip for auto-clipboard)", flush=True)
 
 
-# ── Main pipeline ──
+def handle_wsl(local_path):
+    """WSL mode: copy to WSL filesystem and send path to Claude Code tmux."""
+    # Convert Windows path to WSL-accessible path
+    wsl_screenshot_dir = "/tmp/claude-screenshots"
+    filename = os.path.basename(local_path)
+    wsl_path = f"{wsl_screenshot_dir}/{filename}"
 
-def resolve_target_host():
-    """Determine which host to send the screenshot to."""
-    if args.host:
-        return args.host
+    # Ensure dir exists in WSL
+    subprocess.run(
+        ["wsl", "mkdir", "-p", wsl_screenshot_dir],
+        capture_output=True, timeout=10,
+    )
 
-    host = detect_active_host()
-    if host:
-        print(f"  Detected active SSH host: {host}", flush=True)
-    else:
-        print("  WARNING: Could not detect SSH host from active window.", flush=True)
-        if args.auto:
-            all_hosts = detect_all_ssh_hosts()
-            if len(all_hosts) == 1:
-                host = all_hosts[0]
-                print(f"  Fallback: using only active SSH connection: {host}", flush=True)
-            elif all_hosts:
-                print(f"  Multiple SSH connections found: {all_hosts}", flush=True)
-                print("  Cannot determine target. Focus the correct terminal and retry.", flush=True)
-            else:
-                print("  No active SSH connections found.", flush=True)
-    return host
+    # Copy file to WSL
+    # Windows path like C:\Users\...\file.png -> wsl can access via /mnt/c/Users/...
+    # But easier: just use wsl cp from the Windows path
+    win_path_for_wsl = local_path.replace("\\", "/")
+    # Convert drive letter: C:/... -> /mnt/c/...
+    if len(win_path_for_wsl) >= 2 and win_path_for_wsl[1] == ":":
+        drive = win_path_for_wsl[0].lower()
+        win_path_for_wsl = f"/mnt/{drive}{win_path_for_wsl[2:]}"
+
+    subprocess.run(
+        ["wsl", "cp", win_path_for_wsl, wsl_path],
+        capture_output=True, timeout=10,
+    )
+
+    # Find active tmux session in WSL
+    ret = subprocess.run(
+        ["wsl", "tmux", "list-clients", "-F", "#{client_activity} #{session_name}"],
+        capture_output=True, text=True, timeout=10,
+    )
+    session = None
+    if ret.returncode == 0 and ret.stdout.strip():
+        # Most recent client
+        lines = ret.stdout.strip().splitlines()
+        lines.sort(reverse=True)
+        session = lines[0].split()[-1] if lines else None
+
+    if not session:
+        ret = subprocess.run(
+            ["wsl", "tmux", "list-sessions", "-F", "#{session_activity} #{session_name}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if ret.returncode == 0 and ret.stdout.strip():
+            lines = ret.stdout.strip().splitlines()
+            lines.sort(reverse=True)
+            session = lines[0].split()[-1] if lines else None
+
+    if not session:
+        print(f"  No tmux session found in WSL.", flush=True)
+        print(f"  Screenshot saved at (WSL): {wsl_path}", flush=True)
+        return
+
+    # Send path to tmux
+    escaped = wsl_path.replace("'", "'\\''")
+    subprocess.run(
+        ["wsl", "tmux", "send-keys", "-t", session, f"{escaped}"],
+        capture_output=True, timeout=10,
+    )
+
+    print(f"  -> WSL tmux:{session}", flush=True)
+    print(f"  Image path sent! Press Enter in Claude Code to include it.", flush=True)
 
 
-def transfer_and_send(local_path, host):
-    """Transfer screenshot to remote server and send path to tmux."""
+def handle_remote(local_path, host):
+    """Remote mode: SCP to remote and send path to tmux."""
     filename = os.path.basename(local_path)
     remote_dir = args.remote_dir
     remote_path = f"{remote_dir}/{filename}"
@@ -283,140 +186,170 @@ def transfer_and_send(local_path, host):
         print("  ERROR: SCP failed.", flush=True)
         return
 
-    print(f"  Remote path: {remote_path}", flush=True)
-
     session = get_active_session(host)
     if not session:
-        print("  ERROR: No active tmux session found on remote.", flush=True)
+        print("  ERROR: No active tmux session on remote.", flush=True)
         print(f"  Screenshot saved at: {host}:{remote_path}", flush=True)
         return
 
     send_to_remote_tmux(remote_path, host, session)
-
     print(f"  -> {host} tmux:{session}", flush=True)
-    print("  Image path sent! Press Enter in Claude Code to include it.", flush=True)
+    print(f"  Image path sent! Press Enter in Claude Code to include it.", flush=True)
 
-    if args.cleanup:
+
+# ── SSH host detection (for multi-host / auto mode) ──
+
+def detect_all_ssh_hosts():
+    """Scan all active SSH connections."""
+    hosts = set()
+    try:
+        if IS_WIN:
+            # Windows: check for ssh.exe processes
+            ret = subprocess.run(
+                ["tasklist", "/FI", "IMAGENAME eq ssh.exe", "/FO", "CSV", "/NH"],
+                capture_output=True, text=True, timeout=5,
+            )
+            # Also check via wsl
+            ret2 = subprocess.run(
+                ["wsl", "pgrep", "-a", "ssh"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in ret2.stdout.strip().splitlines():
+                parts = line.split()
+                # Find user@host pattern in ssh command args
+                for p in parts:
+                    if "@" in p and not p.startswith("-"):
+                        hosts.add(p)
+        else:
+            ret = subprocess.run(
+                ["pgrep", "-a", "ssh"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in ret.stdout.strip().splitlines():
+                parts = line.split()
+                for p in parts:
+                    if "@" in p and not p.startswith("-"):
+                        hosts.add(p)
+    except Exception:
+        pass
+    return list(hosts)
+
+
+def resolve_target_host():
+    """Determine which host to send the screenshot to."""
+    if args.host:
+        return args.host
+
+    # Auto/multi-host: scan SSH connections
+    all_hosts = detect_all_ssh_hosts()
+
+    if args.hosts:
+        allowed = set(args.hosts)
+        for h in all_hosts:
+            if h in allowed:
+                return h
+            bare = h.split("@")[-1] if "@" in h else h
+            for a in allowed:
+                if bare == (a.split("@")[-1] if "@" in a else a):
+                    return a
+        print(f"  No matching SSH host found. Active: {all_hosts}, Allowed: {args.hosts}", flush=True)
+        return None
+
+    if len(all_hosts) == 1:
+        host = all_hosts[0]
+        print(f"  Auto-detected SSH host: {host}", flush=True)
+        return host
+    elif all_hosts:
+        print(f"  Multiple SSH connections: {all_hosts}", flush=True)
+        print(f"  Use --host or --hosts to specify target.", flush=True)
+    else:
+        print("  No active SSH connections found.", flush=True)
+    return None
+
+
+# ── Main loop ──
+
+def on_new_screenshot(img):
+    """Handle a newly detected screenshot."""
+    print(f"\n  New screenshot detected!", flush=True)
+    local_path = save_screenshot(img)
+
+    if args.wsl:
+        handle_wsl(local_path)
+    elif args.host or args.hosts or args.auto:
+        host = resolve_target_host()
+        if host:
+            handle_remote(local_path, host)
+        else:
+            # Fallback to local
+            handle_local(local_path)
+    else:
+        handle_local(local_path)
+
+    if args.cleanup and os.path.exists(local_path):
         os.remove(local_path)
 
-    if IS_MAC:
-        print("\n  Ready for next screenshot... (Ctrl+Shift+3=full, Ctrl+Shift+4=region)", flush=True)
-    else:
-        print("\n  Ready for next screenshot... (PrintScreen=full, RIGHT CTRL=region)", flush=True)
 
+def clipboard_monitor_loop():
+    """Main loop: poll clipboard for new images."""
+    global last_image_hash
 
-def handle_screenshot(region=False):
-    """Full pipeline: detect host -> capture -> transfer -> send to tmux."""
-    host = resolve_target_host()
-    if not host:
-        print("  Aborted: no target host.", flush=True)
-        return
-
-    local_path = take_screenshot(region=region)
-    if local_path:
-        transfer_and_send(local_path, host)
-
-
-# ── Keyboard handling ──
-
-def keyboard_loop_evdev():
-    """Linux: keyboard loop via evdev."""
-    import evdev
-    from evdev import ecodes
-    from shared.hotkey import require_keyboard
-
-    dev = require_keyboard()
-
-    for event in dev.read_loop():
-        if event.type != ecodes.EV_KEY:
-            continue
-        key_event = evdev.categorize(event)
-
-        if key_event.scancode == ecodes.KEY_SYSRQ:
-            if key_event.keystate == key_event.key_down:
-                threading.Thread(target=handle_screenshot, kwargs={"region": False}, daemon=True).start()
-
-        elif key_event.scancode == ecodes.KEY_RIGHTCTRL:
-            if key_event.keystate == key_event.key_down:
-                threading.Thread(target=handle_screenshot, kwargs={"region": True}, daemon=True).start()
-
-
-def keyboard_loop_pynput():
-    """macOS: keyboard loop via pynput with Ctrl+Shift+3/4."""
-    from pynput import keyboard
-    from pynput.keyboard import Key
-
-    pressed_keys = set()
-
-    def on_press(key):
-        pressed_keys.add(key)
-        # Ctrl+Shift+3 = full screen
-        if (Key.ctrl_l in pressed_keys or Key.ctrl_r in pressed_keys) and \
-           (Key.shift_l in pressed_keys or Key.shift_r in pressed_keys):
-            try:
-                if hasattr(key, 'char') and key.char == '3':
-                    threading.Thread(target=handle_screenshot, kwargs={"region": False}, daemon=True).start()
-                elif hasattr(key, 'char') and key.char == '4':
-                    threading.Thread(target=handle_screenshot, kwargs={"region": True}, daemon=True).start()
-            except AttributeError:
-                pass
-
-    def on_release(key):
-        pressed_keys.discard(key)
-
-    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
-    listener.start()
-    try:
-        while listener.is_alive():
-            listener.join(timeout=0.5)
-    except KeyboardInterrupt:
-        print("\nExited.")
-        listener.stop()
+    while True:
+        try:
+            img = get_clipboard_image()
+            if img is not None:
+                h = image_hash(img)
+                if h != last_image_hash:
+                    last_image_hash = h
+                    threading.Thread(
+                        target=on_new_screenshot,
+                        args=(img,),
+                        daemon=True,
+                    ).start()
+        except Exception as e:
+            pass  # Silently continue on clipboard errors
+        time.sleep(0.5)
 
 
 def main():
     global args
 
     parser = argparse.ArgumentParser(
-        description="Screenshot input for Claude Code on remote servers."
+        description="Screenshot input for Claude Code. "
+        "Monitors clipboard for new screenshots and sends them to Claude Code."
     )
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--host", help="Single SSH host (e.g. user@remote-ip)")
-    group.add_argument("--hosts", help="Comma-separated SSH hosts for auto-detect")
-    group.add_argument("--auto", action="store_true", help="Auto-detect from active SSH connections")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--wsl", action="store_true",
+                        help="Send to Claude Code running in WSL (Windows only)")
+    target.add_argument("--host",
+                        help="Single SSH host (e.g. user@remote-ip)")
+    target.add_argument("--hosts",
+                        help="Comma-separated SSH hosts for auto-detect")
+    target.add_argument("--auto", action="store_true",
+                        help="Auto-detect from active SSH connections")
     parser.add_argument("--remote-dir", default=SCREENSHOT_REMOTE_DIR,
                         help=f"Remote screenshot directory (default: {SCREENSHOT_REMOTE_DIR})")
     parser.add_argument("--no-cleanup", dest="cleanup", action="store_false", default=True,
-                        help="Keep local screenshot copies")
+                        help="Keep local screenshot copies after transfer")
     args = parser.parse_args()
 
     if args.hosts:
         args.hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
 
-    # Check tools
-    if IS_MAC:
-        # macOS: screencapture is built-in, just check ssh/scp
-        for cmd in ["scp", "ssh"]:
-            if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
-                print(f"ERROR: '{cmd}' not found.")
-                exit(1)
-    else:
-        # Linux: check maim/scrot
-        has_maim = subprocess.run(["which", "maim"], capture_output=True).returncode == 0
-        has_scrot = subprocess.run(["which", "scrot"], capture_output=True).returncode == 0
-        if not has_maim and not has_scrot:
-            print("ERROR: Neither 'maim' nor 'scrot' found.")
-            print("  sudo apt install maim  (recommended)")
-            exit(1)
+    # Validate mode
+    if args.wsl and not IS_WIN:
+        print("ERROR: --wsl is only available on Windows.")
+        exit(1)
 
-        for cmd in ["scp", "ssh", "xdotool"]:
-            if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
-                if cmd == "xdotool" and args.host:
-                    continue
-                print(f"ERROR: '{cmd}' not found.")
-                exit(1)
+    # Check PIL
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        print("ERROR: Pillow not installed.")
+        print("  pip install Pillow")
+        exit(1)
 
-    # Test SSH
+    # Test SSH if remote mode
     if args.host:
         print(f"Testing SSH to {args.host}...", flush=True)
         if not test_ssh(args.host):
@@ -434,38 +367,57 @@ def main():
             ok = test_ssh(host)
             print(f"  {host}: {'OK' if ok else 'FAILED'}", flush=True)
 
-    os.makedirs(SCREENSHOT_LOCAL_DIR, exist_ok=True)
+    # Test WSL access
+    if args.wsl:
+        ret = subprocess.run(["wsl", "echo", "ok"], capture_output=True, text=True, timeout=10)
+        if ret.returncode != 0:
+            print("ERROR: Cannot access WSL.")
+            exit(1)
+        print("WSL OK.", flush=True)
+        # Check tmux in WSL
+        ret = subprocess.run(
+            ["wsl", "tmux", "list-sessions", "-F", "#{session_name}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if ret.returncode == 0 and ret.stdout.strip():
+            print(f"  WSL tmux sessions: {', '.join(ret.stdout.strip().splitlines())}", flush=True)
+        else:
+            print("  Warning: no tmux sessions found in WSL.", flush=True)
 
-    if args.host:
-        mode_str = f"Single host: {args.host}"
+    # Determine mode description
+    if args.wsl:
+        mode_str = "WSL (auto-detect tmux session)"
+    elif args.host:
+        mode_str = f"Remote: {args.host}"
     elif args.hosts:
-        mode_str = f"Multi-host: {', '.join(args.hosts)} (auto-detect from active window)"
+        mode_str = f"Remote multi-host: {', '.join(args.hosts)}"
+    elif args.auto:
+        mode_str = "Remote auto-detect"
     else:
-        mode_str = "Auto-detect: scanning active SSH connections"
+        mode_str = "Local (file path to clipboard)"
 
+    plat = "Windows" if IS_WIN else ("macOS" if IS_MAC else "Linux")
     print("")
     print("=== Screenshot Input for Claude Code ===")
-    print(f"  Platform: {'macOS' if IS_MAC else 'Linux'}")
+    print(f"  Platform: {plat}")
     print(f"  Mode: {mode_str}")
-    print(f"  Remote dir: {args.remote_dir}")
     print("")
-    if IS_MAC:
-        print("  Hotkeys:")
-        print("    Ctrl+Shift+3  -> capture full screen")
-        print("    Ctrl+Shift+4  -> capture selected region")
+    print("  Take a screenshot with your favorite tool:")
+    if IS_WIN:
+        print("    Win+Shift+S  (Snipping Tool)")
+    elif IS_MAC:
+        print("    Cmd+Shift+4  (region)  /  Cmd+Shift+3  (full screen)")
     else:
-        print("  Hotkeys:")
-        print("    PrintScreen   -> capture full screen")
-        print("    RIGHT CTRL    -> capture selected region")
+        print("    Flameshot, Shutter, PrintScreen, or any tool")
     print("")
-    print("  Screenshot path is sent to Claude Code input.")
-    print("  Press Enter in Claude Code to include the image.")
+    print("  Screenshots are detected from clipboard automatically.")
+    print("  Press Ctrl+C to stop.")
     print("", flush=True)
 
-    if IS_MAC:
-        keyboard_loop_pynput()
-    else:
-        keyboard_loop_evdev()
+    try:
+        clipboard_monitor_loop()
+    except KeyboardInterrupt:
+        print("\nStopped.")
 
 
 if __name__ == "__main__":

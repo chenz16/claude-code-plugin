@@ -25,6 +25,7 @@ windows = [
     "soundfile",
     "pynput",
     "pyperclip",
+    "Pillow",
     "python-telegram-bot",
 ]
 linux = [
@@ -32,6 +33,7 @@ linux = [
     "soundfile",
     "pynput",
     "pyperclip",
+    "Pillow",
     "evdev",
     "python-telegram-bot",
 ]
@@ -40,6 +42,7 @@ macos = [
     "soundfile",
     "pynput",
     "pyperclip",
+    "Pillow",
     "python-telegram-bot",
 ]
 

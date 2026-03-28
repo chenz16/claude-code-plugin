@@ -56,25 +56,32 @@ claude-voice --host user@remote-ip
 | WSL | sounddevice | pynput | local paste / SSH remote |
 | Linux | arecord (ALSA) | evdev | SSH + tmux send-keys |
 
-### `claude-screenshot` — Screenshot Input (Linux & macOS)
+### `claude-screenshot` — Screenshot Input (All Platforms)
 
-Capture screenshots and send to remote Claude Code with one hotkey.
+Monitors your clipboard for new screenshots. Use any screenshot tool you like — the plugin detects it automatically.
 
 ```bash
-# Single host
+# Local mode: saves image, puts file path on clipboard for pasting
+claude-screenshot
+
+# Windows: send to Claude Code running in WSL
+claude-screenshot --wsl
+
+# Send to remote server via SSH
 claude-screenshot --host user@remote-ip
 
-# Multi-host: auto-detect from focused terminal window
+# Multi-host auto-detect
 claude-screenshot --hosts user@ip1,user@ip2
 
 # Full auto: scan all active SSH connections
 claude-screenshot --auto
 ```
 
-| Platform | Hotkeys | Capture tool |
-|----------|---------|-------------|
-| Linux | `PrintScreen` = full, `Right Ctrl` = region | maim / scrot |
-| macOS | `Ctrl+Shift+3` = full, `Ctrl+Shift+4` = region | screencapture (built-in) |
+| Platform | Screenshot tool | How it works |
+|----------|----------------|-------------|
+| Windows | `Win+Shift+S` (or any) | Clipboard monitoring |
+| macOS | `Cmd+Shift+4` (or any) | Clipboard monitoring |
+| Linux | Flameshot, PrintScreen, etc. | Clipboard monitoring |
 
 ### `claude-remote` — Remote Access (All Platforms)
 
@@ -101,7 +108,7 @@ claude-remote
 | Tool | Windows | macOS | WSL | Linux |
 |------|---------|-------|-----|-------|
 | `claude-voice` | local paste | local paste / SSH remote | local paste / SSH remote | SSH remote |
-| `claude-screenshot` | - | full support | - | full support |
+| `claude-screenshot` | local / WSL / remote | local / remote | via Windows | local / remote |
 | `claude-remote` | full support | full support | full support | full support |
 
 ## Auto-start as systemd service (Linux)
