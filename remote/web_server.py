@@ -267,10 +267,16 @@ function addMessage(text, who) {
 function sendText() {
   const input = document.getElementById('text-input');
   const text = input.value.trim();
-  if (!text || !ws) return;
+  if (!text) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    addMessage('[Not connected - reconnecting...]', 'bot');
+    connect();
+    return;
+  }
   addMessage(text, 'user');
   ws.send(JSON.stringify({ type: 'text', text: text }));
   input.value = '';
+  input.focus();
 }
 
 async function toggleMic() {
