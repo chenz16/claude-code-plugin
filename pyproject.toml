@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-code-plugin"
+version = "0.1.0"
+description = "Voice input, screenshot sharing, and remote access tools for Claude Code"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "funasr",
+    "modelscope",
+    "numpy",
+    "torch",
+    "torchaudio",
+    "soundfile",
+]
+
+[project.optional-dependencies]
+# torch/torchaudio are pulled in automatically by funasr — no need to list them
+windows = [
+    "sounddevice",
+    "soundfile",
+    "pynput",
+    "pyperclip",
+    "python-telegram-bot",
+]
+linux = [
+    "sounddevice",
+    "soundfile",
+    "pynput",
+    "pyperclip",
+    "evdev",
+    "python-telegram-bot",
+]
+
+[project.scripts]
+claude-voice = "voice.cli:main"
+claude-screenshot = "screenshot.cli:main"
+claude-remote = "remote.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["shared*", "voice*", "screenshot*", "remote*"]
