@@ -287,7 +287,7 @@ async def _process_message(update, user_msg):
     If focused on a terminal, sends directly without AI dispatch.
     Otherwise uses claude -p for intent routing.
     """
-    global _focused_target, _focused_project
+    global _focused_target, _focused_project, _focused_last_activity
 
     # Check focus timeout
     import time
@@ -308,11 +308,27 @@ async def _process_message(update, user_msg):
 
         _focused_last_activity = time.time()
         send_to_pane(_focused_target, user_msg)
-        await asyncio.sleep(2)
-        output = capture_pane(_focused_target, 15)
+
+        # Poll until Claude Code finishes (output stabilizes)
+        await asyncio.sleep(3)
+        last_output = ""
+        stable_count = 0
+        for _ in range(60):  # max ~2 minutes
+            output = capture_pane(_focused_target, 20)
+            if output == last_output:
+                stable_count += 1
+                if stable_count >= 3:  # stable for ~6 seconds = done
+                    break
+            else:
+                stable_count = 0
+                last_output = output
+            await asyncio.sleep(2)
+
+        # Send final result
+        output = capture_pane(_focused_target, 20)
         lines = output.strip().splitlines()
-        trimmed = "\n".join(lines[-8:]) if len(lines) > 8 else output
-        reply = f"[{_focused_project}]\n```\n{trimmed[-2000:]}\n```"
+        trimmed = "\n".join(lines[-10:]) if len(lines) > 10 else output
+        reply = f"[{_focused_project}] Done.\n```\n{trimmed[-2000:]}\n```"
         try:
             await update.message.reply_text(reply, parse_mode="Markdown")
         except Exception:
@@ -392,8 +408,9 @@ async def handle_voice(update, context):
         await update.message.reply_text("Transcription failed.")
         return
 
-    await update.message.reply_text(f"Heard: {text}")
-    # Process transcribed text as if it were a text message
+    # In focus mode: skip "Heard" reply, just send directly
+    if not _focused_target:
+        await update.message.reply_text(f"Heard: {text}")
     await handle_voice_text(update, context, text)
 
 
