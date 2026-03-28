@@ -15,6 +15,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import tempfile
 import time
@@ -32,6 +33,30 @@ _focused_target = None
 _focused_project = None
 _focused_last_activity = 0
 FOCUS_TIMEOUT = 300
+
+
+def clean_terminal_output(text):
+    """Clean terminal output for mobile display."""
+    # Remove ANSI escape codes
+    text = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', text)
+    text = re.sub(r'\x1b\][^\x07]*\x07', '', text)
+    # Remove box-drawing characters and decorative lines
+    text = re.sub(r'[─━┌┐└┘├┤┬┴┼╔╗╚╝╠╣╦╩╬║═│┃▀▄█▌▐░▒▓╭╮╰╯]+', '', text)
+    # Remove lines that are only dashes, equals, underscores, dots, or spaces
+    lines = text.splitlines()
+    cleaned = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Skip pure separator lines
+        if all(c in '-=_~.*#>' for c in stripped):
+            continue
+        # Skip spinner/progress lines
+        if '██' in stripped or '▓▓' in stripped or '░░' in stripped:
+            continue
+        cleaned.append(stripped)
+    return "\n".join(cleaned)
 
 
 def get_instances_info():
@@ -106,9 +131,7 @@ async def handle_message(msg, send_fn):
                 await send_fn({"type": "text", "text": "No terminal. Use /focus first or /peek <n>"})
                 return
             output = capture_pane(target, CAPTURE_LINES)
-            # Clean up terminal output
-            cleaned = "\n".join(l for l in output.splitlines() if l.strip() and not all(c in '-=─━' for c in l.strip()))
-            await send_fn({"type": "text", "text": cleaned[-3000:]})
+            await send_fn({"type": "text", "text": clean_terminal_output(output)[-3000:]})
             return
 
         elif cmd == "/send":
@@ -125,8 +148,7 @@ async def handle_message(msg, send_fn):
             send_to_pane(inst["target"], command)
             await asyncio.sleep(2)
             output = capture_pane(inst["target"], 10)
-            cleaned = "\n".join(l for l in output.splitlines() if l.strip() and not all(c in '-=─━~' for c in l.strip()))
-            await send_fn({"type": "text", "text": cleaned[-1500:]})
+            await send_fn({"type": "text", "text": clean_terminal_output(output)[-1500:]})
             return
 
     # Handle voice audio
@@ -193,11 +215,9 @@ async def handle_message(msg, send_fn):
             await asyncio.sleep(2)
 
         output = capture_pane(_focused_target, 15)
-        # Clean: remove empty lines and separator lines (---, ===, etc)
-        cleaned_lines = [l for l in output.strip().splitlines()
-                        if l.strip() and not all(c in '-=─━~' for c in l.strip())]
-        trimmed = "\n".join(cleaned_lines[-10:])
-        await send_fn({"type": "text", "text": trimmed[-2000:]})
+        cleaned = clean_terminal_output(output)
+        lines = cleaned.splitlines()[-10:]
+        await send_fn({"type": "text", "text": "\n".join(lines)[-2000:]})
         return
 
     # No focus — just show status
