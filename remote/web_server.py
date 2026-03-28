@@ -197,9 +197,7 @@ async def handle_message(msg, send_fn):
             return
 
         _focused_last_activity = time.time()
-        # Tell Claude Code this is mobile mode — concise output
-        mobile_text = f"(I'm on mobile, keep output short, no tables/borders/separators) {text}"
-        send_to_pane(_focused_target, mobile_text)
+        send_to_pane(_focused_target, f"[M] {text}")
 
         # Poll until done
         await asyncio.sleep(3)
