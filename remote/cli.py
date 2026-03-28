@@ -1,14 +1,16 @@
 """
 CLI entry point for claude-remote.
-Cross-platform Telegram bot for remote Claude Code session management.
+Supports two modes:
+  claude-remote           → Telegram bot
+  claude-remote --web     → Local web server (faster, private)
 """
 
 import sys
 import os
 
 
-def main():
-    # Check if .env exists next to this file and auto-load
+def _load_env():
+    """Auto-load .env file if it exists."""
     cli_dir = os.path.dirname(os.path.abspath(__file__))
     env_file = os.path.join(cli_dir, ".env")
     if os.path.exists(env_file):
@@ -22,8 +24,16 @@ def main():
                     if key and value:
                         os.environ.setdefault(key, value)
 
-    from remote.tmux_bot import main as bot_main
-    bot_main()
+
+def main():
+    if "--web" in sys.argv:
+        sys.argv.remove("--web")
+        from remote.web_server import main as web_main
+        web_main()
+    else:
+        _load_env()
+        from remote.tmux_bot import main as bot_main
+        bot_main()
 
 
 if __name__ == "__main__":

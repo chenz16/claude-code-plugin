@@ -36,6 +36,9 @@ linux = [
     "Pillow",
     "evdev",
     "python-telegram-bot",
+    "fastapi",
+    "uvicorn",
+    "qrcode",
 ]
 macos = [
     "sounddevice",
