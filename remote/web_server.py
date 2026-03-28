@@ -106,7 +106,9 @@ async def handle_message(msg, send_fn):
                 await send_fn({"type": "text", "text": "No terminal. Use /focus first or /peek <n>"})
                 return
             output = capture_pane(target, CAPTURE_LINES)
-            await send_fn({"type": "text", "text": f"[{project}]\n{output[-3000:]}"})
+            # Clean up terminal output
+            cleaned = "\n".join(l for l in output.splitlines() if l.strip() and not all(c in '-=─━' for c in l.strip()))
+            await send_fn({"type": "text", "text": cleaned[-3000:]})
             return
 
         elif cmd == "/send":
@@ -123,7 +125,8 @@ async def handle_message(msg, send_fn):
             send_to_pane(inst["target"], command)
             await asyncio.sleep(2)
             output = capture_pane(inst["target"], 10)
-            await send_fn({"type": "text", "text": f"Sent.\n{output[-1500:]}"})
+            cleaned = "\n".join(l for l in output.splitlines() if l.strip() and not all(c in '-=─━~' for c in l.strip()))
+            await send_fn({"type": "text", "text": cleaned[-1500:]})
             return
 
     # Handle voice audio
@@ -183,9 +186,11 @@ async def handle_message(msg, send_fn):
             await asyncio.sleep(2)
 
         output = capture_pane(_focused_target, 15)
-        lines = output.strip().splitlines()
-        trimmed = "\n".join(lines[-10:]) if len(lines) > 10 else output
-        await send_fn({"type": "text", "text": f"[{_focused_project}]\n{trimmed[-2000:]}"})
+        # Clean: remove empty lines and separator lines (---, ===, etc)
+        cleaned_lines = [l for l in output.strip().splitlines()
+                        if l.strip() and not all(c in '-=─━~' for c in l.strip())]
+        trimmed = "\n".join(cleaned_lines[-10:])
+        await send_fn({"type": "text", "text": trimmed[-2000:]})
         return
 
     # No focus — just show status
