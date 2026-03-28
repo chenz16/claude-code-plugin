@@ -10,3 +10,5 @@ venv/
 *.wav
 /tmp/
 wechat_post.md
+.certs/
+*.pem
