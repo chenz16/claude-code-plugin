@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 _focused_target = None
 _focused_project = None
 _focused_last_activity = 0
-FOCUS_TIMEOUT = 300
+FOCUS_TIMEOUT = 1800  # auto-unfocus after 30 minutes of inactivity
 
 
 def clean_terminal_output(text):

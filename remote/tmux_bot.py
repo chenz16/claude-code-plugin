@@ -48,7 +48,7 @@ log = logging.getLogger(__name__)
 _focused_target = None  # stores the tmux target string
 _focused_project = None  # stores the project name for display
 _focused_last_activity = 0  # timestamp of last message in focused mode
-FOCUS_TIMEOUT = 300  # auto-unfocus after 5 minutes of inactivity
+FOCUS_TIMEOUT = 1800  # auto-unfocus after 30 minutes of inactivity
 
 # ---------------------------------------------------------------------------
 # Dispatcher — uses `claude -p` to route user intent
