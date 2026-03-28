@@ -137,17 +137,24 @@ async def handle_message(msg, send_fn):
             return
 
         import base64
+        import subprocess as _sp3
         audio_bytes = base64.b64decode(audio_data)
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+        # Save as webm (browser format), convert to wav for SenseVoice
+        with tempfile.NamedTemporaryFile(suffix=".webm", delete=False) as tmp:
             tmp.write(audio_bytes)
-            tmp_path = tmp.name
+            webm_path = tmp.name
 
+        wav_path = webm_path.replace(".webm", ".wav")
         try:
+            _sp3.run(["ffmpeg", "-y", "-i", webm_path, "-ar", "16000", "-ac", "1", wav_path],
+                     capture_output=True, timeout=10)
             from shared.transcribe import transcribe_file
-            text = transcribe_file(tmp_path)
+            text = transcribe_file(wav_path)
         finally:
-            os.unlink(tmp_path)
+            for p in [webm_path, wav_path]:
+                if os.path.exists(p):
+                    os.unlink(p)
 
         if not text:
             await send_fn({"type": "text", "text": "No speech detected."})
@@ -358,9 +365,14 @@ def main():
     async def websocket_endpoint(websocket: WebSocket):
         await websocket.accept()
         log.info("Client connected: %s", websocket.client)
+        connected = True
 
         async def send_fn(msg):
-            await websocket.send_json(msg)
+            if connected:
+                try:
+                    await websocket.send_json(msg)
+                except Exception:
+                    pass
 
         try:
             while True:
@@ -370,9 +382,10 @@ def main():
                 try:
                     await handle_message(msg, send_fn)
                 except Exception as e:
-                    log.error("Error handling message: %s", e, exc_info=True)
+                    log.error("Error: %s", e, exc_info=True)
                     await send_fn({"type": "text", "text": f"Error: {e}"})
         except WebSocketDisconnect:
+            connected = False
             log.info("Client disconnected")
 
     # Get the right IP for phone access
