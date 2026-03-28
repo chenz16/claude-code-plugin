@@ -198,26 +198,32 @@ async def handle_message(msg, send_fn):
 
         _focused_last_activity = time.time()
         send_to_pane(_focused_target, f"[M] {text}")
+        await send_fn({"type": "text", "text": "Sent."})
 
-        # Poll until done
-        await asyncio.sleep(3)
-        last_output = ""
-        stable_count = 0
-        for _ in range(60):
-            output = capture_pane(_focused_target, 20)
-            if output == last_output:
-                stable_count += 1
-                if stable_count >= 3:
-                    break
-            else:
-                stable_count = 0
-                last_output = output
-            await asyncio.sleep(2)
+        # Poll in background — don't block new messages
+        async def poll_result():
+            target = _focused_target
+            project = _focused_project
+            if not target:
+                return
+            await asyncio.sleep(3)
+            last_output = ""
+            stable_count = 0
+            for _ in range(60):
+                output = capture_pane(target, 20)
+                if output == last_output:
+                    stable_count += 1
+                    if stable_count >= 3:
+                        break
+                else:
+                    stable_count = 0
+                    last_output = output
+                await asyncio.sleep(2)
+            cleaned = clean_terminal_output(capture_pane(target, 15))
+            lines = cleaned.splitlines()[-10:]
+            await send_fn({"type": "text", "text": "\n".join(lines)[-2000:]})
 
-        output = capture_pane(_focused_target, 15)
-        cleaned = clean_terminal_output(output)
-        lines = cleaned.splitlines()[-10:]
-        await send_fn({"type": "text", "text": "\n".join(lines)[-2000:]})
+        asyncio.create_task(poll_result())
         return
 
     # No focus — just show status
