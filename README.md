@@ -1,73 +1,103 @@
 # Claude Code Plugin
 
-A toolkit for enhancing Claude Code, especially on remote servers via SSH + tmux.
+Voice input, screenshot sharing, and remote access tools for Claude Code.
 
-## Modules
+## Quick Install
 
-### Voice Input (`voice/`)
-Mandarin speech recognition for Claude Code using Alibaba SenseVoice.
-- `voice_input.py` — Linux + evdev, sends to remote tmux via SSH
-- `voice_input_linux.py` — Linux/WSL, local paste or remote SSH mode
-- `voice_input_win.py` — Windows, local paste via clipboard
+### Windows (PowerShell)
 
-**Usage:**
-```bash
-python -m voice.voice_input --host user@remote-ip
-python -m voice.voice_input_linux                     # local paste
-python -m voice.voice_input_linux --host user@remote  # remote
+```powershell
+pip install "git+https://github.com/chenz16/claude-code-plugin.git[windows]"
 ```
 
-### Screenshot Input (`screenshot/`)
-One-hotkey screenshot capture and transfer to remote Claude Code.
-- PrintScreen → full screen
-- Right Ctrl → region selection
+### Linux
 
-**Usage:**
-```bash
-python -m screenshot.screenshot_input --host user@remote-ip
-python -m screenshot.screenshot_input --hosts user@ip1,user@ip2
-python -m screenshot.screenshot_input --auto
-```
-
-### Remote Access (`remote/`)
-Telegram bot for monitoring and controlling Claude Code sessions remotely.
-- Natural language routing via `claude -p`
-- Voice message transcription
-- Multi-instance management
-
-**Usage:**
-```bash
-cp remote/.env.example remote/.env  # edit with your tokens
-bash remote/start.sh
-```
-
-## Shared (`shared/`)
-
-Common code extracted from all modules:
-
-| Module | Description | Used by |
-|--------|-------------|---------|
-| `config.py` | Centralized settings (audio, tmux, SSH, etc.) | All |
-| `transcribe.py` | SenseVoice speech-to-text | voice, remote |
-| `hotkey.py` | evdev global keyboard detection | voice, screenshot |
-| `ssh_remote.py` | SSH connection, remote tmux operations | voice, screenshot |
-| `tmux_utils.py` | Local tmux instance discovery and control | remote |
-
-## Installation
-
-### Linux (voice + screenshot + remote)
 ```bash
 sudo apt install alsa-utils maim xdotool
 sudo usermod -aG input $USER  # log out/in after
-pip install -r requirements_linux.txt
+pip install "git+https://github.com/chenz16/claude-code-plugin.git[linux]"
 ```
 
-### Windows (voice only)
-```powershell
-pip install -r requirements_win.txt
+### WSL (Ubuntu on Windows)
+
+```bash
+sudo apt install libportaudio2
+pip install "git+https://github.com/chenz16/claude-code-plugin.git[linux]"
 ```
 
-## Auto-start as systemd service
+> First run downloads the SenseVoice model (~1GB). After that it starts instantly.
+
+## Commands
+
+### `claude-voice` — Voice Input
+
+Auto-detects your platform (Windows / WSL / Linux) and runs the right mode.
+
+```bash
+# Windows: hold Right Alt to speak, release to paste into focused window
+claude-voice
+
+# WSL: same as Windows, local paste mode
+claude-voice
+
+# Linux: send voice to remote Claude Code via SSH + tmux
+claude-voice --host user@remote-ip
+```
+
+| Platform | Audio | Keyboard | Output |
+|----------|-------|----------|--------|
+| Windows | sounddevice | pynput | clipboard paste (Ctrl+V) |
+| WSL | sounddevice | pynput | local paste or SSH remote |
+| Linux | arecord (ALSA) | evdev | SSH + tmux send-keys |
+
+### `claude-screenshot` — Screenshot Input (Linux only)
+
+Capture screenshots and send to remote Claude Code with one hotkey.
+
+```bash
+# Single host
+claude-screenshot --host user@remote-ip
+
+# Multi-host: auto-detect from focused terminal window
+claude-screenshot --hosts user@ip1,user@ip2
+
+# Full auto: scan all active SSH connections
+claude-screenshot --auto
+```
+
+**Hotkeys:**
+- `PrintScreen` → full screen capture
+- `Right Ctrl` → region selection
+
+### `claude-remote` — Remote Access (Windows & Linux)
+
+Telegram bot for monitoring and controlling Claude Code sessions.
+
+```bash
+# Set up config
+cp remote/.env.example remote/.env
+# Edit remote/.env with your TG_BOT_TOKEN and TG_USER_ID
+
+# Run
+claude-remote
+```
+
+**Bot commands:**
+- `/list` — show all active Claude Code sessions
+- `/peek <n>` — view terminal #n output
+- `/send <n> <text>` — type text into terminal #n
+- Natural language — AI-powered routing via `claude -p`
+- Voice messages — auto-transcribed with SenseVoice
+
+## Platform Support
+
+| Tool | Windows | WSL | Linux |
+|------|---------|-----|-------|
+| `claude-voice` | local paste | local paste / SSH remote | SSH remote |
+| `claude-screenshot` | - | - | full support |
+| `claude-remote` | full support | full support | full support |
+
+## Auto-start as systemd service (Linux)
 
 ```bash
 # Voice input
@@ -76,6 +106,36 @@ bash scripts/setup_service.sh voice --host user@remote-ip
 # Screenshot input
 bash scripts/setup_service.sh screenshot --host user@remote-ip
 ```
+
+Manage services:
+```bash
+systemctl --user status voice-input.service
+journalctl --user -u voice-input.service -f
+systemctl --user restart voice-input.service
+```
+
+## Project Structure
+
+```
+claude-code-plugin/
+├── shared/           # Common modules
+│   ├── config.py     # Centralized settings
+│   ├── transcribe.py # SenseVoice speech-to-text
+│   ├── hotkey.py     # evdev global keyboard
+│   ├── ssh_remote.py # SSH + remote tmux
+│   └── tmux_utils.py # Local tmux discovery
+├── voice/            # Voice input (all platforms)
+├── screenshot/       # Screenshot input (Linux)
+├── remote/           # Remote access (Telegram bot)
+└── scripts/          # Systemd service installer
+```
+
+## Speech Model
+
+Uses [SenseVoiceSmall](https://github.com/FunAudioLLM/SenseVoice) by Alibaba FunAudioLLM:
+- Best-in-class Mandarin + Cantonese recognition
+- Also supports English, Japanese, Korean
+- ~1GB model, runs fully offline after first download
 
 ## License
 
