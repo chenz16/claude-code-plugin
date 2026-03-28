@@ -14,6 +14,7 @@ Usage:
 
 import sys
 import os
+import platform
 import threading
 import queue
 import subprocess
@@ -27,14 +28,28 @@ from shared.transcribe import load_model, transcribe_audio
 
 audio_queue = queue.Queue()
 is_recording = False
+IS_MAC = platform.system() == "Darwin"
 
 
 # ====== Output methods ======
 
 def paste_text_local(text):
-    """Local paste: use xdotool or xclip to paste into focused window."""
+    """Local paste: auto-detect platform and paste into focused window."""
     if not text:
         return
+
+    if IS_MAC:
+        # macOS: pbcopy + Cmd+V
+        subprocess.run(["pbcopy"], input=text.encode(), timeout=5)
+        from pynput.keyboard import Key, Controller
+        kb = Controller()
+        kb.press(Key.cmd)
+        kb.press("v")
+        kb.release("v")
+        kb.release(Key.cmd)
+        return
+
+    # Linux / WSL: xdotool or xclip
     try:
         subprocess.run(
             ["xdotool", "type", "--clearmodifiers", text],
@@ -156,12 +171,13 @@ def main():
     args = parser.parse_args()
 
     mode = "remote" if args.host else "local"
-    use_evdev = args.use_evdev and not IS_WSL
+    use_evdev = args.use_evdev and not IS_WSL and not IS_MAC
 
+    plat = "macOS" if IS_MAC else ("WSL" if IS_WSL else "Linux")
     print("=" * 50)
     print("  Chinese Voice Input (SenseVoiceSmall)")
     print(f"  Mode: {'remote -> ' + args.host if args.host else 'local paste'}")
-    print(f"  Platform: {'WSL' if IS_WSL else 'Linux'}")
+    print(f"  Platform: {plat}")
     print("  Hold Right Alt to speak, release to transcribe")
     print("  Esc or Ctrl+C to exit")
     print("=" * 50)

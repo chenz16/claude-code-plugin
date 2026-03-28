@@ -35,6 +35,13 @@ linux = [
     "evdev",
     "python-telegram-bot",
 ]
+macos = [
+    "sounddevice",
+    "soundfile",
+    "pynput",
+    "pyperclip",
+    "python-telegram-bot",
+]
 
 [project.scripts]
 claude-voice = "voice.cli:main"

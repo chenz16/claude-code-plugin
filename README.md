@@ -10,6 +10,14 @@ Voice input, screenshot sharing, and remote access tools for Claude Code.
 pip install "git+https://github.com/chenz16/claude-code-plugin.git[windows]"
 ```
 
+### macOS (Terminal)
+
+```bash
+pip install "git+https://github.com/chenz16/claude-code-plugin.git[macos]"
+```
+
+> macOS may prompt for Accessibility permission (needed for global hotkeys). Go to System Settings > Privacy & Security > Accessibility and allow your terminal app.
+
 ### Linux
 
 ```bash
@@ -31,26 +39,24 @@ pip install "git+https://github.com/chenz16/claude-code-plugin.git[linux]"
 
 ### `claude-voice` — Voice Input
 
-Auto-detects your platform (Windows / WSL / Linux) and runs the right mode.
+Hold Right Alt to speak, release to transcribe. Auto-detects your platform.
 
 ```bash
-# Windows: hold Right Alt to speak, release to paste into focused window
+# Windows / macOS / WSL: local paste mode
 claude-voice
 
-# WSL: same as Windows, local paste mode
-claude-voice
-
-# Linux: send voice to remote Claude Code via SSH + tmux
+# Linux / macOS: send to remote Claude Code via SSH
 claude-voice --host user@remote-ip
 ```
 
 | Platform | Audio | Keyboard | Output |
 |----------|-------|----------|--------|
-| Windows | sounddevice | pynput | clipboard paste (Ctrl+V) |
-| WSL | sounddevice | pynput | local paste or SSH remote |
+| Windows | sounddevice | pynput | Ctrl+V paste |
+| macOS | sounddevice | pynput | Cmd+V paste / SSH remote |
+| WSL | sounddevice | pynput | local paste / SSH remote |
 | Linux | arecord (ALSA) | evdev | SSH + tmux send-keys |
 
-### `claude-screenshot` — Screenshot Input (Linux only)
+### `claude-screenshot` — Screenshot Input (Linux & macOS)
 
 Capture screenshots and send to remote Claude Code with one hotkey.
 
@@ -65,11 +71,12 @@ claude-screenshot --hosts user@ip1,user@ip2
 claude-screenshot --auto
 ```
 
-**Hotkeys:**
-- `PrintScreen` → full screen capture
-- `Right Ctrl` → region selection
+| Platform | Hotkeys | Capture tool |
+|----------|---------|-------------|
+| Linux | `PrintScreen` = full, `Right Ctrl` = region | maim / scrot |
+| macOS | `Ctrl+Shift+3` = full, `Ctrl+Shift+4` = region | screencapture (built-in) |
 
-### `claude-remote` — Remote Access (Windows & Linux)
+### `claude-remote` — Remote Access (All Platforms)
 
 Telegram bot for monitoring and controlling Claude Code sessions.
 
@@ -91,11 +98,11 @@ claude-remote
 
 ## Platform Support
 
-| Tool | Windows | WSL | Linux |
-|------|---------|-----|-------|
-| `claude-voice` | local paste | local paste / SSH remote | SSH remote |
-| `claude-screenshot` | - | - | full support |
-| `claude-remote` | full support | full support | full support |
+| Tool | Windows | macOS | WSL | Linux |
+|------|---------|-------|-----|-------|
+| `claude-voice` | local paste | local paste / SSH remote | local paste / SSH remote | SSH remote |
+| `claude-screenshot` | - | full support | - | full support |
+| `claude-remote` | full support | full support | full support | full support |
 
 ## Auto-start as systemd service (Linux)
 
@@ -105,13 +112,6 @@ bash scripts/setup_service.sh voice --host user@remote-ip
 
 # Screenshot input
 bash scripts/setup_service.sh screenshot --host user@remote-ip
-```
-
-Manage services:
-```bash
-systemctl --user status voice-input.service
-journalctl --user -u voice-input.service -f
-systemctl --user restart voice-input.service
 ```
 
 ## Project Structure
@@ -125,7 +125,7 @@ claude-code-plugin/
 │   ├── ssh_remote.py # SSH + remote tmux
 │   └── tmux_utils.py # Local tmux discovery
 ├── voice/            # Voice input (all platforms)
-├── screenshot/       # Screenshot input (Linux)
+├── screenshot/       # Screenshot input (Linux & macOS)
 ├── remote/           # Remote access (Telegram bot)
 └── scripts/          # Systemd service installer
 ```

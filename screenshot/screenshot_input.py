@@ -1,41 +1,37 @@
 #!/usr/bin/env python3
 """
 Screenshot input for Claude Code on remote servers.
-Press PrintScreen for full screen, or RIGHT CTRL to select a region.
 Captures locally, transfers to remote, sends image path to tmux.
+
+Hotkeys:
+  Linux:  PrintScreen = full screen, Right Ctrl = region
+  macOS:  Ctrl+Shift+3 = full screen, Ctrl+Shift+4 = region
 
 Modes:
   1. Single-host:  --host user@remote-ip
   2. Multi-host:   --hosts user@ip1,user@ip2  (auto-detect from window)
   3. Full auto:    --auto  (scan all SSH connections)
 
-Usage:
-  python -m screenshot.screenshot_input --host user@remote-ip
-  python -m screenshot.screenshot_input --hosts user@ip1,user@ip2
-  python -m screenshot.screenshot_input --auto
-
-Dependencies:
-  pip install evdev
-  sudo apt install maim xdotool
-  User must be in 'input' group: sudo usermod -aG input $USER
+Supports: Linux (evdev + maim/scrot) and macOS (pynput + screencapture)
 """
 
 import os
+import platform
 import subprocess
 import threading
 import time
 import argparse
-from evdev import ecodes
 
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from shared.config import SCREENSHOT_LOCAL_DIR, SCREENSHOT_REMOTE_DIR
-from shared.hotkey import require_keyboard
 from shared.ssh_remote import (
     test_ssh, get_active_session, send_to_remote_tmux,
     ensure_remote_dir, scp_to_remote, list_remote_sessions,
 )
+
+IS_MAC = platform.system() == "Darwin"
 
 args = None
 screenshot_counter = 0
@@ -46,6 +42,21 @@ lock = threading.Lock()
 
 def get_focused_window_pid():
     """Get the PID of the currently focused window."""
+    if IS_MAC:
+        # macOS: use AppleScript to get frontmost app PID
+        try:
+            ret = subprocess.run(
+                ["osascript", "-e",
+                 'tell application "System Events" to get unix id of first process whose frontmost is true'],
+                capture_output=True, text=True, timeout=3,
+            )
+            if ret.returncode == 0 and ret.stdout.strip():
+                return int(ret.stdout.strip())
+        except Exception:
+            pass
+        return None
+
+    # Linux: xdotool
     try:
         wid = subprocess.run(
             ["xdotool", "getactivewindow"],
@@ -85,11 +96,22 @@ def get_child_pids(pid):
 def get_ssh_host_from_pid(pid):
     """Extract the SSH destination host from a process's cmdline."""
     try:
-        cmdline_path = f"/proc/{pid}/cmdline"
-        if not os.path.exists(cmdline_path):
-            return None
-        with open(cmdline_path, "rb") as f:
-            cmdline = f.read().decode("utf-8", errors="replace").split("\x00")
+        if IS_MAC:
+            # macOS: use ps to get command line
+            ret = subprocess.run(
+                ["ps", "-o", "args=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=3,
+            )
+            if ret.returncode != 0 or not ret.stdout.strip():
+                return None
+            cmdline = ret.stdout.strip().split()
+        else:
+            # Linux: read /proc
+            cmdline_path = f"/proc/{pid}/cmdline"
+            if not os.path.exists(cmdline_path):
+                return None
+            with open(cmdline_path, "rb") as f:
+                cmdline = f.read().decode("utf-8", errors="replace").split("\x00")
 
         if not cmdline or "ssh" not in os.path.basename(cmdline[0]):
             return None
@@ -183,17 +205,25 @@ def take_screenshot(region=False):
     print(f"\n  Capturing {'region' if region else 'full screen'}...", flush=True)
 
     try:
-        if region:
-            ret = subprocess.run(["maim", "-s", local_path], capture_output=True, text=True, timeout=30)
-        else:
-            ret = subprocess.run(["maim", local_path], capture_output=True, text=True, timeout=10)
-
-        if ret.returncode != 0:
-            print("  maim failed, trying scrot...", flush=True)
+        if IS_MAC:
+            # macOS: screencapture (built-in)
             if region:
-                ret = subprocess.run(["scrot", "-s", local_path], capture_output=True, text=True, timeout=30)
+                ret = subprocess.run(["screencapture", "-i", local_path], capture_output=True, text=True, timeout=30)
             else:
-                ret = subprocess.run(["scrot", local_path], capture_output=True, text=True, timeout=10)
+                ret = subprocess.run(["screencapture", local_path], capture_output=True, text=True, timeout=10)
+        else:
+            # Linux: maim or scrot
+            if region:
+                ret = subprocess.run(["maim", "-s", local_path], capture_output=True, text=True, timeout=30)
+            else:
+                ret = subprocess.run(["maim", local_path], capture_output=True, text=True, timeout=10)
+
+            if ret.returncode != 0:
+                print("  maim failed, trying scrot...", flush=True)
+                if region:
+                    ret = subprocess.run(["scrot", "-s", local_path], capture_output=True, text=True, timeout=30)
+                else:
+                    ret = subprocess.run(["scrot", local_path], capture_output=True, text=True, timeout=10)
 
         if ret.returncode != 0:
             print(f"  ERROR: Screenshot capture failed: {ret.stderr}", flush=True)
@@ -269,7 +299,10 @@ def transfer_and_send(local_path, host):
     if args.cleanup:
         os.remove(local_path)
 
-    print("\n  Ready for next screenshot... (PrintScreen=full, RIGHT CTRL=region)", flush=True)
+    if IS_MAC:
+        print("\n  Ready for next screenshot... (Ctrl+Shift+3=full, Ctrl+Shift+4=region)", flush=True)
+    else:
+        print("\n  Ready for next screenshot... (PrintScreen=full, RIGHT CTRL=region)", flush=True)
 
 
 def handle_screenshot(region=False):
@@ -286,9 +319,13 @@ def handle_screenshot(region=False):
 
 # ── Keyboard handling ──
 
-def keyboard_loop(dev):
-    """Main loop reading keyboard events via evdev."""
+def keyboard_loop_evdev():
+    """Linux: keyboard loop via evdev."""
     import evdev
+    from evdev import ecodes
+    from shared.hotkey import require_keyboard
+
+    dev = require_keyboard()
 
     for event in dev.read_loop():
         if event.type != ecodes.EV_KEY:
@@ -302,6 +339,39 @@ def keyboard_loop(dev):
         elif key_event.scancode == ecodes.KEY_RIGHTCTRL:
             if key_event.keystate == key_event.key_down:
                 threading.Thread(target=handle_screenshot, kwargs={"region": True}, daemon=True).start()
+
+
+def keyboard_loop_pynput():
+    """macOS: keyboard loop via pynput with Ctrl+Shift+3/4."""
+    from pynput import keyboard
+    from pynput.keyboard import Key
+
+    pressed_keys = set()
+
+    def on_press(key):
+        pressed_keys.add(key)
+        # Ctrl+Shift+3 = full screen
+        if (Key.ctrl_l in pressed_keys or Key.ctrl_r in pressed_keys) and \
+           (Key.shift_l in pressed_keys or Key.shift_r in pressed_keys):
+            try:
+                if hasattr(key, 'char') and key.char == '3':
+                    threading.Thread(target=handle_screenshot, kwargs={"region": False}, daemon=True).start()
+                elif hasattr(key, 'char') and key.char == '4':
+                    threading.Thread(target=handle_screenshot, kwargs={"region": True}, daemon=True).start()
+            except AttributeError:
+                pass
+
+    def on_release(key):
+        pressed_keys.discard(key)
+
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+    listener.start()
+    try:
+        while listener.is_alive():
+            listener.join(timeout=0.5)
+    except KeyboardInterrupt:
+        print("\nExited.")
+        listener.stop()
 
 
 def main():
@@ -324,19 +394,27 @@ def main():
         args.hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
 
     # Check tools
-    has_maim = subprocess.run(["which", "maim"], capture_output=True).returncode == 0
-    has_scrot = subprocess.run(["which", "scrot"], capture_output=True).returncode == 0
-    if not has_maim and not has_scrot:
-        print("ERROR: Neither 'maim' nor 'scrot' found.")
-        print("  sudo apt install maim  (recommended)")
-        exit(1)
-
-    for cmd in ["scp", "ssh", "xdotool"]:
-        if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
-            if cmd == "xdotool" and args.host:
-                continue
-            print(f"ERROR: '{cmd}' not found.")
+    if IS_MAC:
+        # macOS: screencapture is built-in, just check ssh/scp
+        for cmd in ["scp", "ssh"]:
+            if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
+                print(f"ERROR: '{cmd}' not found.")
+                exit(1)
+    else:
+        # Linux: check maim/scrot
+        has_maim = subprocess.run(["which", "maim"], capture_output=True).returncode == 0
+        has_scrot = subprocess.run(["which", "scrot"], capture_output=True).returncode == 0
+        if not has_maim and not has_scrot:
+            print("ERROR: Neither 'maim' nor 'scrot' found.")
+            print("  sudo apt install maim  (recommended)")
             exit(1)
+
+        for cmd in ["scp", "ssh", "xdotool"]:
+            if subprocess.run(["which", cmd], capture_output=True).returncode != 0:
+                if cmd == "xdotool" and args.host:
+                    continue
+                print(f"ERROR: '{cmd}' not found.")
+                exit(1)
 
     # Test SSH
     if args.host:
@@ -358,8 +436,6 @@ def main():
 
     os.makedirs(SCREENSHOT_LOCAL_DIR, exist_ok=True)
 
-    dev = require_keyboard()
-
     if args.host:
         mode_str = f"Single host: {args.host}"
     elif args.hosts:
@@ -369,18 +445,27 @@ def main():
 
     print("")
     print("=== Screenshot Input for Claude Code ===")
+    print(f"  Platform: {'macOS' if IS_MAC else 'Linux'}")
     print(f"  Mode: {mode_str}")
     print(f"  Remote dir: {args.remote_dir}")
     print("")
-    print("  Hotkeys:")
-    print("    PrintScreen   -> capture full screen")
-    print("    RIGHT CTRL    -> capture selected region")
+    if IS_MAC:
+        print("  Hotkeys:")
+        print("    Ctrl+Shift+3  -> capture full screen")
+        print("    Ctrl+Shift+4  -> capture selected region")
+    else:
+        print("  Hotkeys:")
+        print("    PrintScreen   -> capture full screen")
+        print("    RIGHT CTRL    -> capture selected region")
     print("")
     print("  Screenshot path is sent to Claude Code input.")
     print("  Press Enter in Claude Code to include the image.")
     print("", flush=True)
 
-    keyboard_loop(dev)
+    if IS_MAC:
+        keyboard_loop_pynput()
+    else:
+        keyboard_loop_evdev()
 
 
 if __name__ == "__main__":

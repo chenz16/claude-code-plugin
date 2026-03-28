@@ -1,6 +1,13 @@
 """
 CLI entry point for claude-voice.
 Auto-detects platform and runs the appropriate voice input module.
+
+Platform routing:
+  Windows  → voice_input_win.py   (sounddevice + pynput + Ctrl+V paste)
+  macOS    → voice_input_linux.py (sounddevice + pynput + pbcopy/Cmd+V paste)
+  WSL      → voice_input_linux.py (sounddevice + pynput)
+  Linux    → voice_input.py       (arecord + evdev, SSH remote mode)
+           → voice_input_linux.py (local mode)
 """
 
 import sys
@@ -13,6 +20,12 @@ def main():
     if os_name == "Windows":
         from voice.voice_input_win import main as win_main
         win_main()
+
+    elif os_name == "Darwin":
+        # macOS: uses sounddevice + pynput (same engine as Linux local mode)
+        from voice.voice_input_linux import main as linux_main
+        linux_main()
+
     elif os_name == "Linux":
         # Check if WSL
         is_wsl = False
@@ -23,16 +36,8 @@ def main():
             pass
 
         if is_wsl:
-            # WSL: check if --host is passed -> use SSH remote mode
-            # otherwise use local paste mode (pynput + sounddevice)
-            if "--host" in sys.argv:
-                from voice.voice_input_linux import main as linux_main
-                linux_main()
-            else:
-                # WSL local mode: prefer voice_input_win style (sounddevice + pynput)
-                # but since we're in WSL, use voice_input_linux which handles both
-                from voice.voice_input_linux import main as linux_main
-                linux_main()
+            from voice.voice_input_linux import main as linux_main
+            linux_main()
         else:
             # Native Linux
             if "--host" in sys.argv:
@@ -40,12 +45,11 @@ def main():
                 from voice.voice_input import main as remote_main
                 remote_main()
             else:
-                # Local mode
                 from voice.voice_input_linux import main as linux_main
                 linux_main()
     else:
         print(f"Unsupported platform: {os_name}")
-        print("Supported: Windows, Linux, WSL")
+        print("Supported: Windows, macOS, Linux, WSL")
         sys.exit(1)
 
 
