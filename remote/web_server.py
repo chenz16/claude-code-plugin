@@ -231,9 +231,9 @@ button { border: none; border-radius: 50%; width: 44px; height: 44px; cursor: po
 </div>
 <div id="messages"></div>
 <div id="input-area">
-  <button id="mic-btn" onclick="toggleMic()">🎤</button>
+  <button id="mic-btn" ontouchend="event.preventDefault();toggleMic()" onclick="toggleMic()">🎤</button>
   <input id="text-input" placeholder="Type or use voice..." onkeydown="if(event.key==='Enter')sendText()">
-  <button id="send-btn" onclick="sendText()">→</button>
+  <button id="send-btn" ontouchend="event.preventDefault();sendText()" onclick="sendText()">→</button>
 </div>
 
 <script>
@@ -348,7 +348,11 @@ def main():
                 data = await websocket.receive_text()
                 msg = json.loads(data)
                 log.info("Received: %s", str(msg)[:100])
-                await handle_message(msg, send_fn)
+                try:
+                    await handle_message(msg, send_fn)
+                except Exception as e:
+                    log.error("Error handling message: %s", e, exc_info=True)
+                    await send_fn({"type": "text", "text": f"Error: {e}"})
         except WebSocketDisconnect:
             log.info("Client disconnected")
 
