@@ -231,7 +231,7 @@ button { border: none; border-radius: 50%; width: 56px; height: 56px; cursor: po
 </div>
 <div id="messages"></div>
 <div id="input-area">
-  <button id="mic-btn" ontouchstart="event.preventDefault();toggleMic()" onclick="toggleMic()">🎤</button>
+  <button id="mic-btn" ontouchstart="event.preventDefault();startMic()" ontouchend="event.preventDefault();stopMic()" onmousedown="startMic()" onmouseup="stopMic()">🎤</button>
   <input id="text-input" placeholder="Type or use voice..." onkeydown="if(event.key==='Enter')sendText()">
   <button id="send-btn" ontouchstart="event.preventDefault();sendText()" onclick="sendText()">→</button>
 </div>
@@ -279,37 +279,45 @@ function sendText() {
   input.focus();
 }
 
-async function toggleMic() {
+let micStream = null;
+
+async function startMic() {
+  if (isRecording) return;
   const btn = document.getElementById('mic-btn');
-  if (isRecording) {
-    isRecording = false;
-    btn.classList.remove('recording');
-    btn.textContent = '🎤';
-    mediaRecorder.stop();
-  } else {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
-      mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm' });
-      audioChunks = [];
-      mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
-      mediaRecorder.onstop = async () => {
-        stream.getTracks().forEach(t => t.stop());
-        const blob = new Blob(audioChunks, { type: 'audio/webm' });
-        const reader = new FileReader();
-        reader.onload = () => {
-          const base64 = reader.result.split(',')[1];
-          addMessage('[voice message]', 'user');
-          ws.send(JSON.stringify({ type: 'audio', data: base64 }));
-        };
-        reader.readAsDataURL(blob);
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
+    mediaRecorder = new MediaRecorder(micStream, { mimeType: 'audio/webm' });
+    audioChunks = [];
+    mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
+    mediaRecorder.onstop = async () => {
+      micStream.getTracks().forEach(t => t.stop());
+      micStream = null;
+      const blob = new Blob(audioChunks, { type: 'audio/webm' });
+      const reader = new FileReader();
+      reader.onload = () => {
+        const base64 = reader.result.split(',')[1];
+        addMessage('[voice]', 'user');
+        ws.send(JSON.stringify({ type: 'audio', data: base64 }));
       };
-      mediaRecorder.start();
-      isRecording = true;
-      btn.classList.add('recording');
-      btn.textContent = '⏹';
-    } catch (err) {
-      addMessage('Mic access denied: ' + err.message, 'bot');
-    }
+      reader.readAsDataURL(blob);
+    };
+    mediaRecorder.start();
+    isRecording = true;
+    btn.classList.add('recording');
+    btn.textContent = '⏹';
+  } catch (err) {
+    addMessage('Mic error: ' + err.message, 'bot');
+  }
+}
+
+function stopMic() {
+  if (!isRecording) return;
+  const btn = document.getElementById('mic-btn');
+  isRecording = false;
+  btn.classList.remove('recording');
+  btn.textContent = '🎤';
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
+    mediaRecorder.stop();
   }
 }
 
