@@ -217,9 +217,9 @@ body { font-family: -apple-system, system-ui, sans-serif; background: #1a1a2e; c
 #input-area { background: #16213e; padding: 10px; border-top: 1px solid #333; display: flex; gap: 8px; align-items: center; }
 #text-input { flex: 1; padding: 10px; border-radius: 20px; border: 1px solid #444; background: #1a1a2e; color: #eee; font-size: 15px; outline: none; }
 #text-input:focus { border-color: #4CAF50; }
-button { border: none; border-radius: 50%; width: 44px; height: 44px; cursor: pointer; display: flex; align-items: center; justify-content: center; }
-#send-btn { background: #4CAF50; color: white; font-size: 18px; }
-#mic-btn { background: #333; color: #eee; font-size: 20px; }
+button { border: none; border-radius: 50%; width: 56px; height: 56px; cursor: pointer; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
+#send-btn { background: #4CAF50; color: white; font-size: 22px; min-width: 56px; }
+#mic-btn { background: #e53935; color: white; font-size: 26px; min-width: 56px; }
 #mic-btn.recording { background: #f44336; animation: pulse 1s infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
 </style>
@@ -231,9 +231,9 @@ button { border: none; border-radius: 50%; width: 44px; height: 44px; cursor: po
 </div>
 <div id="messages"></div>
 <div id="input-area">
-  <button id="mic-btn" ontouchend="event.preventDefault();toggleMic()" onclick="toggleMic()">🎤</button>
+  <button id="mic-btn" ontouchstart="event.preventDefault();toggleMic()" onclick="toggleMic()">🎤</button>
   <input id="text-input" placeholder="Type or use voice..." onkeydown="if(event.key==='Enter')sendText()">
-  <button id="send-btn" ontouchend="event.preventDefault();sendText()" onclick="sendText()">→</button>
+  <button id="send-btn" ontouchstart="event.preventDefault();sendText()" onclick="sendText()">→</button>
 </div>
 
 <script>
@@ -243,7 +243,7 @@ let audioChunks = [];
 let isRecording = false;
 
 function connect() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
   ws = new WebSocket(proto + '//' + location.host + '/ws');
   ws.onopen = () => { document.getElementById('status').textContent = 'connected'; };
   ws.onclose = () => {
@@ -413,7 +413,7 @@ def main():
         except Exception:
             pass
 
-    url = f"http://{local_ip}:{args.port}"
+    url = f"https://{local_ip}:{args.port}"
     print("")
     print("=" * 50)
     print("  Claude Code Remote (Local Web)")
@@ -436,7 +436,29 @@ def main():
     print("=" * 50)
     print("", flush=True)
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    # Generate self-signed cert for HTTPS (required for mobile mic access)
+    cert_dir = os.path.join(os.path.dirname(__file__), ".certs")
+    cert_file = os.path.join(cert_dir, "cert.pem")
+    key_file = os.path.join(cert_dir, "key.pem")
+
+    if not os.path.exists(cert_file):
+        os.makedirs(cert_dir, exist_ok=True)
+        log.info("Generating self-signed certificate for HTTPS...")
+        import subprocess as _sp2
+        _sp2.run([
+            "openssl", "req", "-x509", "-newkey", "rsa:2048",
+            "-keyout", key_file, "-out", cert_file,
+            "-days", "365", "-nodes",
+            "-subj", f"/CN={local_ip}",
+            "-addext", f"subjectAltName=IP:{local_ip}",
+        ], capture_output=True)
+
+    print(f"\n  NOTE: First time on phone, accept the security warning")
+    print(f"  (self-signed certificate is safe on your private network)")
+    print("", flush=True)
+
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning",
+                ssl_certfile=cert_file, ssl_keyfile=key_file)
 
 
 if __name__ == "__main__":
