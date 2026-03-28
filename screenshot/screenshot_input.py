@@ -97,15 +97,30 @@ def save_screenshot(img):
 
 
 def handle_local(local_path):
-    """Local mode: put file path on clipboard so user can Ctrl+V into Claude Code."""
+    """Local mode: auto-type file path into focused window (like voice does)."""
     try:
         import pyperclip
+        from pynput.keyboard import Key, Controller
+        kb = Controller()
+
         pyperclip.copy(local_path)
-        print(f"  File path copied to clipboard!", flush=True)
-        print(f"  Paste (Ctrl+V) into Claude Code to include the image.", flush=True)
-    except ImportError:
+        time.sleep(0.1)
+
+        if IS_MAC:
+            kb.press(Key.cmd)
+            kb.press("v")
+            kb.release("v")
+            kb.release(Key.cmd)
+        else:
+            kb.press(Key.ctrl)
+            kb.press("v")
+            kb.release("v")
+            kb.release(Key.ctrl)
+
+        print(f"  Path auto-pasted to focused window!", flush=True)
+    except Exception as e:
         print(f"  Path: {local_path}", flush=True)
-        print(f"  (install pyperclip for auto-clipboard)", flush=True)
+        print(f"  (auto-paste failed: {e})", flush=True)
 
 
 def handle_wsl(local_path):
@@ -269,22 +284,65 @@ def resolve_target_host():
 
 # ── Main loop ──
 
+def check_wsl_tmux():
+    """Check if WSL has an active tmux session. Returns True if found."""
+    if not IS_WIN:
+        return False
+    try:
+        ret = subprocess.run(
+            ["wsl", "tmux", "list-sessions"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return ret.returncode == 0 and ret.stdout.strip() != ""
+    except Exception:
+        return False
+
+
 def on_new_screenshot(img):
-    """Handle a newly detected screenshot."""
+    """Handle a newly detected screenshot.
+
+    Auto-detection priority:
+      1. If --host/--hosts/--auto specified → remote mode
+      2. If --wsl specified → WSL mode
+      3. Auto: check WSL tmux → check SSH connections → local paste
+    """
     print(f"\n  New screenshot detected!", flush=True)
     local_path = save_screenshot(img)
 
-    if args.wsl:
-        handle_wsl(local_path)
-    elif args.host or args.hosts or args.auto:
+    sent = False
+
+    if args.host or args.hosts or args.auto:
+        # Explicit remote mode
         host = resolve_target_host()
         if host:
             handle_remote(local_path, host)
-        else:
-            # Fallback to local
-            handle_local(local_path)
+            sent = True
+    elif args.wsl:
+        # Explicit WSL mode
+        handle_wsl(local_path)
+        sent = True
     else:
-        handle_local(local_path)
+        # Auto-detect: WSL tmux → SSH → local
+        if IS_WIN and check_wsl_tmux():
+            print(f"  Auto-detected: Claude Code in WSL tmux", flush=True)
+            handle_wsl(local_path)
+            sent = True
+        else:
+            # Check for SSH connections
+            ssh_hosts = detect_all_ssh_hosts()
+            if len(ssh_hosts) == 1:
+                print(f"  Auto-detected: SSH to {ssh_hosts[0]}", flush=True)
+                handle_remote(local_path, ssh_hosts[0])
+                sent = True
+            elif not ssh_hosts:
+                # Local mode: auto-type into focused window
+                handle_local(local_path)
+                sent = True
+            else:
+                print(f"  Multiple SSH connections: {ssh_hosts}", flush=True)
+                print(f"  Use --host to specify, falling back to local paste.", flush=True)
+                handle_local(local_path)
+                sent = True
 
     if args.cleanup and os.path.exists(local_path):
         os.remove(local_path)
@@ -316,17 +374,18 @@ def main():
 
     parser = argparse.ArgumentParser(
         description="Screenshot input for Claude Code. "
-        "Monitors clipboard for new screenshots and sends them to Claude Code."
+        "Monitors clipboard for new screenshots and auto-sends to Claude Code. "
+        "No flags needed — auto-detects WSL tmux, SSH connections, or pastes locally."
     )
     target = parser.add_mutually_exclusive_group()
     target.add_argument("--wsl", action="store_true",
-                        help="Send to Claude Code running in WSL (Windows only)")
+                        help="Force send to WSL tmux (Windows only)")
     target.add_argument("--host",
-                        help="Single SSH host (e.g. user@remote-ip)")
+                        help="Force send to this SSH host (e.g. user@remote-ip)")
     target.add_argument("--hosts",
-                        help="Comma-separated SSH hosts for auto-detect")
+                        help="Comma-separated SSH hosts for multi-host mode")
     target.add_argument("--auto", action="store_true",
-                        help="Auto-detect from active SSH connections")
+                        help="Force auto-detect from SSH connections")
     parser.add_argument("--remote-dir", default=SCREENSHOT_REMOTE_DIR,
                         help=f"Remote screenshot directory (default: {SCREENSHOT_REMOTE_DIR})")
     parser.add_argument("--no-cleanup", dest="cleanup", action="store_false", default=True,
@@ -386,15 +445,15 @@ def main():
 
     # Determine mode description
     if args.wsl:
-        mode_str = "WSL (auto-detect tmux session)"
+        mode_str = "WSL tmux (forced)"
     elif args.host:
-        mode_str = f"Remote: {args.host}"
+        mode_str = f"Remote: {args.host} (forced)"
     elif args.hosts:
         mode_str = f"Remote multi-host: {', '.join(args.hosts)}"
     elif args.auto:
-        mode_str = "Remote auto-detect"
+        mode_str = "Remote auto-detect (forced)"
     else:
-        mode_str = "Local (file path to clipboard)"
+        mode_str = "Auto-detect (WSL tmux -> SSH -> local paste)"
 
     plat = "Windows" if IS_WIN else ("macOS" if IS_MAC else "Linux")
     print("")

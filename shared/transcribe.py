@@ -14,9 +14,26 @@ import numpy as np
 _model = None
 
 
+# Common misrecognitions → corrections
+# SenseVoice doesn't know proper nouns like "Claude", add more as needed
+CORRECTIONS = {
+    "cloud code": "Claude Code",
+    "Cloud Code": "Claude Code",
+    "cloud cord": "Claude Code",
+    "clad code": "Claude Code",
+    "claud code": "Claude Code",
+    "klod code": "Claude Code",
+    "cloud": "Claude",
+    "Cloud": "Claude",
+}
+
+
 def clean_text(text):
-    """Remove SenseVoice metadata tags like <|zh|><|NEUTRAL|><|EMO|>"""
-    return re.sub(r"<\|[^|]*\|>", "", text).strip()
+    """Remove SenseVoice metadata tags and fix common misrecognitions."""
+    text = re.sub(r"<\|[^|]*\|>", "", text).strip()
+    for wrong, right in CORRECTIONS.items():
+        text = text.replace(wrong, right)
+    return text
 
 
 def load_model():
