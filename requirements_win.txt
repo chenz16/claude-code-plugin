@@ -1,0 +1,11 @@
+# Shared: SenseVoice speech recognition
+funasr
+modelscope
+torch
+torchaudio
+sounddevice
+numpy
+
+# Voice input (Windows)
+pynput
+pyperclip

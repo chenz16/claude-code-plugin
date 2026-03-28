@@ -1,0 +1,19 @@
+# Shared: SenseVoice speech recognition
+funasr
+modelscope
+torch
+torchaudio
+soundfile
+numpy
+
+# Voice input (Linux)
+evdev
+sounddevice
+pynput
+pyperclip
+
+# Screenshot input
+# (evdev already listed above)
+
+# Remote access (Telegram bot)
+python-telegram-bot
