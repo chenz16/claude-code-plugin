@@ -391,14 +391,16 @@ def main():
     async def websocket_endpoint(websocket: WebSocket):
         await websocket.accept()
         log.info("Client connected: %s", websocket.client)
-        connected = True
+        state = {"connected": True}
 
         async def send_fn(msg):
-            if connected:
+            if state["connected"]:
                 try:
                     await websocket.send_json(msg)
-                except Exception:
-                    pass
+                    log.info("Sent to client: %s", str(msg.get("text", ""))[:80])
+                except Exception as e:
+                    log.error("Send failed: %s", e)
+                    state["connected"] = False
 
         try:
             while True:
@@ -411,7 +413,7 @@ def main():
                     log.error("Error: %s", e, exc_info=True)
                     await send_fn({"type": "text", "text": f"Error: {e}"})
         except WebSocketDisconnect:
-            connected = False
+            state["connected"] = False
             log.info("Client disconnected")
 
     # Get the right IP for phone access
