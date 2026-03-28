@@ -2,6 +2,40 @@
 
 Voice input, screenshot sharing, and remote access tools for Claude Code.
 
+## Problems We Solve
+
+### 1. No Mandarin Voice Input
+Claude Code's built-in voice input does not support Mandarin. For Chinese-speaking developers, this means typing everything — switching between Chinese and English input methods constantly.
+
+**Solution:** `claude-voice` uses Alibaba's SenseVoiceSmall model locally. Best-in-class Mandarin recognition, runs offline, no API fees. Hold Right Alt, speak, release — text appears in Claude Code.
+
+### 2. Screenshot Sharing Is Painful (Especially Remote)
+Claude Code can read images, but getting a screenshot to it is a multi-step nightmare: take screenshot → save file → scp to remote → type the path → press Enter. On remote servers via SSH, there's no clipboard bridge at all.
+
+**Solution:** `claude-screenshot` monitors your clipboard automatically. Take a screenshot with any tool (Win+Shift+S, Cmd+Shift+4, etc.), and it auto-detects where Claude Code is running (local, WSL, or remote) and sends the image there. Or just say "帮我看看这张截图" via voice — the plugin grabs the screenshot and sends it along with your voice command.
+
+### 3. Cross-Platform Setup Is Complicated
+Getting voice input and remote access working across Windows, WSL, macOS, and Linux involves different audio systems, keyboard APIs, and network configurations. WSL adds extra complexity with port forwarding and audio device bridging.
+
+**Solution:** `claude-plugin` auto-detects your platform and picks the right backend. One `pip install` command, one unified CLI. WSL port forwarding is set up automatically. No manual configuration needed.
+
+### 4. Telegram Remote Access Is Slow
+Using a Telegram bot for remote Claude Code control means every message goes through Telegram's servers (overseas), adding 2-10 seconds of latency. Voice messages are even slower.
+
+**Solution:** `claude-remote --web` runs a private WebSocket server on your machine. Phone connects directly over LAN — zero cloud latency. Voice recording happens in the browser, SenseVoice runs on your server, results stream back in real-time.
+
+### 5. Privacy — Everything Should Stay Private
+Cloud-based voice recognition, third-party bots, and public relay servers all mean your code and conversations pass through someone else's infrastructure.
+
+**Solution:** Everything runs locally. SenseVoice model runs on your machine (no API calls). The web server is your own private server — data goes directly between your phone and your machine, never touches any cloud. Even remote access via Tailscale is a direct encrypted peer-to-peer tunnel.
+
+### 6. Device Auto-Detection
+Manually specifying which terminal, which server, which tmux session to send to is tedious. The tool should just know.
+
+**Solution:** Auto-detection everywhere. `claude-voice` detects Windows/Mac/WSL/Linux and picks the right mode. `claude-screenshot` detects if Claude Code is in WSL tmux, SSH remote, or local — and sends there automatically. `claude-remote --web` auto-detects your LAN IP, generates QR code, sets up port forwarding, and creates HTTPS certificates — all automatically.
+
+---
+
 ## Quick Install
 
 ### Windows (PowerShell)
@@ -33,21 +67,31 @@ pip install "git+https://github.com/chenz16/claude-code-plugin.git[linux]"
 
 > First run downloads the SenseVoice model (~1GB). After that it starts instantly.
 
-## Commands
+## Usage
 
-### `claude-voice` — Voice Input
-
-Hold Right Alt to speak, release to transcribe. Auto-detects your platform.
+All commands available through `claude-plugin`:
 
 ```bash
-# Windows / macOS / WSL: local paste mode
-claude-voice
-
-# Linux / macOS: send to remote Claude Code via SSH
-claude-voice --host user@remote-ip
+claude-plugin voice              # Voice input
+claude-plugin screenshot         # Screenshot clipboard monitor
+claude-plugin remote --web       # Phone remote control (private web server)
+claude-plugin remote             # Telegram bot
+claude-plugin status             # Show running services
+claude-plugin help               # Help
 ```
 
-Voice + screenshot integration: say "look at this screenshot" (or Chinese equivalents like "帮我看看这张截图") and the plugin auto-grabs the latest screenshot from clipboard and sends it to Claude Code along with your voice text.
+Individual commands also work: `claude-voice`, `claude-screenshot`, `claude-remote`.
+
+### Voice Input
+
+Hold Right Alt to speak, release to transcribe. Auto-detects platform.
+
+```bash
+claude-plugin voice                        # local paste (Windows/Mac/WSL)
+claude-plugin voice --host user@remote-ip  # send to remote server
+```
+
+**Voice + Screenshot:** Say "帮我看看这张截图" or "look at this screenshot" — the plugin auto-grabs the latest screenshot from clipboard and sends it to Claude Code with your voice text.
 
 | Platform | Audio | Keyboard | Output |
 |----------|-------|----------|--------|
@@ -56,135 +100,87 @@ Voice + screenshot integration: say "look at this screenshot" (or Chinese equiva
 | WSL | sounddevice | pynput | local paste / SSH remote |
 | Linux | arecord (ALSA) | evdev | SSH + tmux send-keys |
 
-### `claude-screenshot` — Screenshot Input (All Platforms)
+### Screenshot Input
 
-Monitors your clipboard for new screenshots. Use any screenshot tool you like — the plugin detects it automatically.
-
-```bash
-# Auto-detect: WSL tmux → SSH → local paste
-claude-screenshot
-
-# Force send to WSL tmux
-claude-screenshot --wsl
-
-# Force send to remote server
-claude-screenshot --host user@remote-ip
-```
-
-| Platform | Screenshot tool | How it works |
-|----------|----------------|-------------|
-| Windows | `Win+Shift+S` (or any) | Clipboard monitoring, auto-detect target |
-| macOS | `Cmd+Shift+4` (or any) | Clipboard monitoring |
-| Linux | Flameshot, PrintScreen, etc. | Clipboard monitoring |
-
-### `claude-remote` — Remote Access (All Platforms)
-
-Two modes: private local web server (fast) or Telegram bot (anywhere).
-
-#### Local Web Server (recommended)
-
-Zero-latency private server. Access from phone browser.
+Monitors clipboard. Use any screenshot tool you like.
 
 ```bash
-claude-remote --web
+claude-plugin screenshot                     # auto-detect target
+claude-plugin screenshot --wsl               # force WSL tmux
+claude-plugin screenshot --host user@ip      # force remote
 ```
 
-- QR code shown in terminal — scan with phone to connect
-- HTTPS with auto-generated certificate (required for mobile mic)
-- Voice recording in browser + SenseVoice on server
-- Real-time output streaming from Claude Code
-- Add to phone home screen for app-like experience (PWA)
+### Phone Remote Control
 
-**Commands (in web UI or Telegram):**
-- `/list` — show all active Claude Code sessions
-- `/focus <n>` — lock onto terminal #n (direct mode, all messages go there)
-- `/unfocus` — back to AI routing mode
+Private web server with real-time voice and text.
+
+```bash
+claude-plugin remote --web
+```
+
+- QR code in terminal — scan to connect
+- HTTPS auto-generated (required for mobile mic)
+- Press-and-hold mic button, like WeChat voice
+- Real-time terminal output streaming
+- Add to phone home screen as app (PWA)
+
+**Commands (web UI):**
+- `/list` — show Claude Code sessions
+- `/focus <n>` — lock onto terminal #n (direct mode)
+- `/unfocus` — back to AI routing
 - `/peek [n]` — view terminal output
-- `/send <n> <text>` — type text into terminal
+- Just type or speak — goes straight to focused terminal
 
-In focus mode: just type or speak, goes straight to the terminal. Auto-unfocus after 30 min idle.
+Auto-unfocus after 30 min idle. Messages from mobile auto-tagged `[M]` for concise Claude Code output.
 
-#### Telegram Bot
-
-For access via Telegram (higher latency, works anywhere).
+### Telegram Bot (backup)
 
 ```bash
-# Set up config
-cp remote/.env.example remote/.env
-# Edit with your TG_BOT_TOKEN and TG_USER_ID
-
-claude-remote
+cp remote/.env.example remote/.env  # add TG_BOT_TOKEN and TG_USER_ID
+claude-plugin remote
 ```
 
 ## Remote Access Outside LAN
 
 ### Tailscale (recommended)
 
-Access your server from anywhere (coffee shop, mobile data, etc.) with zero configuration:
+Access from anywhere — coffee shop, mobile data, through corporate VPNs:
 
 ```bash
-# On your server (WSL/Linux)
+# Server
 curl -fsSL https://tailscale.com/install.sh | sudo sh
 sudo tailscale up
-tailscale ip  # note your Tailscale IP (100.x.x.x)
+tailscale ip  # → 100.x.x.x
+
+# Phone: install Tailscale app, login same account
+# Access: https://100.x.x.x:8080
 ```
 
-On your phone: install Tailscale app (free, App Store / Google Play), login with same account.
-
-Then access from anywhere:
-```
-https://<tailscale-ip>:8080
-```
-
-Tailscale creates a direct encrypted tunnel between devices. Data never goes through any cloud server. Works through corporate VPNs and firewalls.
+Direct encrypted tunnel. Data never goes through any cloud.
 
 ### WSL Port Forwarding
 
-For LAN access from WSL, port forwarding is set up automatically. If manual setup is needed (run in Windows PowerShell as Admin):
+Auto-configured on startup. Manual setup if needed (Windows PowerShell Admin):
 
 ```powershell
-# Get WSL IP
-wsl hostname -I
-
-# Set up port forwarding
 netsh interface portproxy add v4tov4 listenport=8080 listenaddress=0.0.0.0 connectport=8080 connectaddress=<WSL-IP>
-
-# Allow through firewall
 New-NetFirewallRule -DisplayName "Claude Code Remote" -Direction Inbound -LocalPort 8080 -Protocol TCP -Action Allow
-```
-
-## Mobile Mode
-
-Messages from the web UI are prefixed with `[M]` tag. Add this to your project's CLAUDE.md to enable concise mobile-friendly output:
-
-```markdown
-When a message starts with [M], keep responses short (2-3 sentences),
-no tables, no box-drawing characters, no decorative separators.
 ```
 
 ## Platform Support
 
 | Tool | Windows | macOS | WSL | Linux |
 |------|---------|-------|-----|-------|
-| `claude-voice` | local paste | local paste / SSH remote | local paste / SSH remote | SSH remote |
-| `claude-screenshot` | local / WSL / remote | local / remote | via Windows | local / remote |
-| `claude-remote --web` | full support | full support | full support | full support |
-| `claude-remote` (Telegram) | full support | full support | full support | full support |
-
-## Auto-start as systemd service (Linux)
-
-```bash
-# Voice input
-bash scripts/setup_service.sh voice --host user@remote-ip
-
-# Screenshot input
-bash scripts/setup_service.sh screenshot --host user@remote-ip
-```
+| `claude-plugin voice` | local paste | local paste / SSH | local paste / SSH | SSH remote |
+| `claude-plugin screenshot` | local / WSL / remote | local / remote | via Windows | local / remote |
+| `claude-plugin remote --web` | full | full | full | full |
+| `claude-plugin remote` (Telegram) | full | full | full | full |
 
 ## Project Structure
 
 ```
 claude-code-plugin/
+├── cli.py               # Unified entry point (claude-plugin)
 ├── shared/              # Common modules
 │   ├── config.py        # Centralized settings
 │   ├── transcribe.py    # SenseVoice speech-to-text
@@ -195,17 +191,10 @@ claude-code-plugin/
 ├── voice/               # Voice input (all platforms)
 ├── screenshot/          # Screenshot input (all platforms)
 ├── remote/              # Remote access
-│   ├── web_server.py    # Local WebSocket server (fast, private)
+│   ├── web_server.py    # Private WebSocket server
 │   └── tmux_bot.py      # Telegram bot
 └── scripts/             # Systemd service installer
 ```
-
-## Speech Model
-
-Uses [SenseVoiceSmall](https://github.com/FunAudioLLM/SenseVoice) by Alibaba FunAudioLLM:
-- Best-in-class Mandarin + Cantonese recognition
-- Also supports English, Japanese, Korean
-- ~1GB model, runs fully offline after first download
 
 ## License
 
