@@ -241,7 +241,12 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>Claude Code Remote</title>
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#1a1a2e">
+<link rel="manifest" href="/manifest.json">
+<title>Claude Code</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: -apple-system, system-ui, sans-serif; background: #1a1a2e; color: #eee; height: 100vh; display: flex; flex-direction: column; }
@@ -386,6 +391,19 @@ def main():
     @app.get("/")
     async def index():
         return HTMLResponse(HTML_PAGE)
+
+    @app.get("/manifest.json")
+    async def manifest():
+        from fastapi.responses import JSONResponse
+        return JSONResponse({
+            "name": "Claude Code Remote",
+            "short_name": "Claude",
+            "start_url": "/",
+            "display": "standalone",
+            "background_color": "#1a1a2e",
+            "theme_color": "#1a1a2e",
+            "description": "Voice & text remote control for Claude Code",
+        })
 
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
