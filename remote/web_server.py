@@ -200,28 +200,37 @@ async def handle_message(msg, send_fn):
         send_to_pane(_focused_target, f"[M] {text}")
         await send_fn({"type": "text", "text": "Sent."})
 
-        # Poll in background — don't block new messages
+        # Poll in background — stream new output incrementally
         async def poll_result():
             target = _focused_target
-            project = _focused_project
             if not target:
                 return
-            await asyncio.sleep(3)
-            last_output = ""
+            await asyncio.sleep(2)
+            last_output = capture_pane(target, 20)
             stable_count = 0
-            for _ in range(60):
+            for _ in range(90):  # max ~3 minutes
+                await asyncio.sleep(2)
                 output = capture_pane(target, 20)
                 if output == last_output:
                     stable_count += 1
-                    if stable_count >= 3:
+                    if stable_count >= 3:  # stable 6s = done
                         break
                 else:
+                    # New output — send the diff
+                    old_lines = set(last_output.splitlines())
+                    new_lines = [l for l in output.splitlines() if l not in old_lines]
+                    if new_lines:
+                        cleaned = clean_terminal_output("\n".join(new_lines[-5:]))
+                        if cleaned.strip():
+                            await send_fn({"type": "text", "text": cleaned[-1000:]})
                     stable_count = 0
                     last_output = output
-                await asyncio.sleep(2)
-            cleaned = clean_terminal_output(capture_pane(target, 15))
-            lines = cleaned.splitlines()[-10:]
-            await send_fn({"type": "text", "text": "\n".join(lines)[-2000:]})
+            # Final summary
+            cleaned = clean_terminal_output(capture_pane(target, 10))
+            lines = cleaned.splitlines()[-5:]
+            final = "\n".join(lines)
+            if final.strip():
+                await send_fn({"type": "text", "text": final[-1000:]})
 
         asyncio.create_task(poll_result())
         return
