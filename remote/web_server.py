@@ -352,16 +352,56 @@ def main():
         except WebSocketDisconnect:
             log.info("Client disconnected")
 
-    # Get local IP for display
+    # Get the right IP for phone access
     import socket
+    import subprocess as _sp
     local_ip = "localhost"
+
+    # Check if running in WSL — need Windows host IP, not WSL internal IP
+    is_wsl = False
     try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
+        with open("/proc/version", "r") as f:
+            is_wsl = "microsoft" in f.read().lower()
     except Exception:
         pass
+
+    if is_wsl:
+        # Get Windows LAN IP (accessible from phone)
+        try:
+            ret = _sp.run(
+                ["powershell.exe", "-Command",
+                 "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notmatch 'Loopback|vEthernet|WSL' -and $_.IPAddress -notmatch '^169\\.' } | Select -First 1 -ExpandProperty IPAddress"],
+                capture_output=True, text=True, timeout=10,
+            )
+            win_ip = ret.stdout.strip().split("\n")[0].strip()
+            if win_ip:
+                local_ip = win_ip
+                # Auto-setup port forwarding (WSL IP -> Windows)
+                wsl_ip = "localhost"
+                try:
+                    s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    s2.connect(("8.8.8.8", 80))
+                    wsl_ip = s2.getsockname()[0]
+                    s2.close()
+                except Exception:
+                    pass
+                _sp.run(
+                    ["powershell.exe", "-Command",
+                     f"netsh interface portproxy delete v4tov4 listenport={args.port} listenaddress=0.0.0.0 2>$null; "
+                     f"netsh interface portproxy add v4tov4 listenport={args.port} listenaddress=0.0.0.0 "
+                     f"connectport={args.port} connectaddress={wsl_ip}"],
+                    capture_output=True, timeout=10,
+                )
+        except Exception:
+            pass
+    else:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
 
     url = f"http://{local_ip}:{args.port}"
     print("")
