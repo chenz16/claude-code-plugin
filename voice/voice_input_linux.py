@@ -221,6 +221,18 @@ def main():
             text = transcribe_audio(audio_data)
             if text:
                 print(f"[result] {text}")
+
+                # Check if user mentions a screenshot → grab from clipboard first
+                from shared.clipboard_image import has_screenshot_intent, grab_clipboard_image
+                if has_screenshot_intent(text):
+                    img_path = grab_clipboard_image()
+                    if img_path:
+                        if mode == "remote":
+                            send_text_remote(img_path, args.host)
+                        else:
+                            paste_text_local(img_path)
+                            import time as _t; _t.sleep(0.2)
+
                 if mode == "remote":
                     send_text_remote(text, args.host)
                 else:

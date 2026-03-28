@@ -80,6 +80,14 @@ def do_transcribe():
             print("  ERROR: No active tmux session found on remote.", flush=True)
             return
 
+        # Check if user mentions a screenshot → grab from clipboard first
+        from shared.clipboard_image import has_screenshot_intent, grab_clipboard_image
+        if has_screenshot_intent(text):
+            img_path = grab_clipboard_image()
+            if img_path:
+                send_to_remote_tmux(img_path, args.host, session)
+                print(f"  -> screenshot sent: {img_path}", flush=True)
+
         print(f"  -> tmux:{session}", flush=True)
         send_to_remote_tmux(text, args.host, session)
         print("  Sent!", flush=True)

@@ -91,6 +91,20 @@ def stop_recording():
         text = transcribe_audio(audio_data)
         if text:
             print(f"[result] {text}")
+
+            # Check if user mentions a screenshot → grab from clipboard first
+            from shared.clipboard_image import has_screenshot_intent, grab_clipboard_image
+            if has_screenshot_intent(text):
+                img_path = grab_clipboard_image()
+                if img_path:
+                    paste_text(img_path)
+                    time.sleep(0.2)
+                    # Send Enter to confirm the image path, then paste the text
+                    from pynput.keyboard import Key
+                    kb_controller.press(Key.enter)
+                    kb_controller.release(Key.enter)
+                    time.sleep(0.2)
+
             paste_text(text)
         else:
             print("[warning] No speech detected")
