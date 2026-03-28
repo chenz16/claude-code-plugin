@@ -44,6 +44,12 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
+# Focused terminal state: when set, all messages go directly to this terminal
+_focused_target = None  # stores the tmux target string
+_focused_project = None  # stores the project name for display
+_focused_last_activity = 0  # timestamp of last message in focused mode
+FOCUS_TIMEOUT = 300  # auto-unfocus after 5 minutes of inactivity
+
 # ---------------------------------------------------------------------------
 # Dispatcher — uses `claude -p` to route user intent
 # ---------------------------------------------------------------------------
@@ -70,9 +76,12 @@ def build_dispatch_prompt(user_message, instances):
         "1. Determine which terminal(s) the user is referring to. If the message is about all terminals, set target to 0.\n"
         "2. Determine the action: \"peek\" (just read status) or \"send\" (type something into the terminal).\n"
         "3. If action is \"send\", determine what text to type. Be very careful - this gets typed directly into an interactive Claude Code session.\n"
-        "4. Write a brief summary for the user in the same language they used.\n\n"
+        "4. Write a concise summary (1-2 sentences MAX) for the user in the same language they used. "
+        "The user reads this on a phone via Telegram — be precise and actionable. "
+        "Summarize WHAT the terminal is doing and WHETHER it succeeded/failed/is still running. "
+        "Do NOT dump raw terminal output. Do NOT be verbose.\n\n"
         "Reply with ONLY valid JSON, no markdown fences, no explanation:\n"
-        '{"target": <number, 0 for all>, "action": "peek" or "send", "command": "text to type if send, else empty string", "summary": "brief status in user language"}'
+        '{"target": <number, 0 for all>, "action": "peek" or "send", "command": "text to type if send, else empty string", "summary": "1-2 sentence status in user language"}'
     )
 
 
@@ -123,12 +132,14 @@ async def cmd_start(update, context):
         return
     await update.message.reply_text(
         "Claude Code Remote Monitor\n\n"
-        "Send any message to check on your Claude Code sessions.\n"
         "Commands:\n"
         "/list - show all active sessions\n"
-        "/peek <n> - show terminal #n output\n"
-        "/send <n> <text> - type text into terminal #n\n"
-        "Or just describe what you want in natural language."
+        "/focus <n> - lock onto terminal #n (direct mode)\n"
+        "/unfocus - back to AI routing mode\n"
+        "/peek [n] - show terminal output\n"
+        "/send <n> <text> - type text into terminal\n\n"
+        "In focus mode: just type or speak, goes straight to the terminal.\n"
+        "Auto-unfocus after 5 min idle."
     )
 
 
@@ -161,6 +172,13 @@ async def cmd_peek(update, context):
     instances = find_claude_instances()
     if not instances:
         await update.message.reply_text("No active Claude Code sessions found.")
+        return
+
+    # If focused and no arg, peek the focused terminal
+    if _focused_target and not context.args:
+        output = capture_pane(_focused_target, CAPTURE_LINES)
+        text = f"[{_focused_project}]\n\n```\n{output[-3500:]}\n```"
+        await update.message.reply_text(text, parse_mode="Markdown")
         return
 
     try:
@@ -201,13 +219,107 @@ async def cmd_send(update, context):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 
+async def cmd_focus(update, context):
+    """Lock onto a specific terminal — all messages go directly there."""
+    global _focused_target, _focused_project, _focused_last_activity
+    if not is_authorized(update):
+        return
+
+    instances = find_claude_instances()
+    if not instances:
+        await update.message.reply_text("No active Claude Code sessions found.")
+        return
+
+    try:
+        idx = int(context.args[0]) - 1
+        inst = instances[idx]
+    except (IndexError, ValueError):
+        await update.message.reply_text(f"Usage: /focus <1-{len(instances)}>")
+        return
+
+    import time
+    _focused_target = inst["target"]
+    _focused_project = inst["project"]
+    _focused_last_activity = time.time()
+    output = capture_pane(_focused_target, 10)
+    lines = output.strip().splitlines()
+    trimmed = "\n".join(lines[-5:]) if len(lines) > 5 else output
+    await update.message.reply_text(
+        f"Focused on [{_focused_project}]\n"
+        f"All messages now go directly to this terminal.\n"
+        f"/unfocus to switch back to auto mode.\n\n"
+        f"```\n{trimmed}\n```",
+        parse_mode="Markdown",
+    )
+
+
+async def cmd_unfocus(update, context):
+    """Release focus — go back to auto-dispatch mode."""
+    global _focused_target, _focused_project
+    if not is_authorized(update):
+        return
+
+    _focused_target = None
+    _focused_project = None
+    await update.message.reply_text("Unfocused. Messages will use AI routing again.")
+
+
+async def handle_voice_text(update, context, user_msg):
+    """Handle transcribed voice text — same as handle_text but with provided text."""
+    if not is_authorized(update):
+        return
+    log.info("Voice message from %s: %s", update.effective_user.id, user_msg[:100])
+    await _process_message(update, user_msg)
+
+
 async def handle_text(update, context):
     if not is_authorized(update):
         return
 
     user_msg = update.message.text
     log.info("Message from %s: %s", update.effective_user.id, user_msg[:100])
+    await _process_message(update, user_msg)
 
+
+async def _process_message(update, user_msg):
+    """Core message processing — used by both text and voice handlers.
+
+    If focused on a terminal, sends directly without AI dispatch.
+    Otherwise uses claude -p for intent routing.
+    """
+    global _focused_target, _focused_project
+
+    # Check focus timeout
+    import time
+    if _focused_target and (time.time() - _focused_last_activity > FOCUS_TIMEOUT):
+        _focused_target = None
+        _focused_project = None
+        await update.message.reply_text(f"Auto-unfocused (idle > {FOCUS_TIMEOUT // 60}min). Using AI routing.")
+
+    # Focused mode: send directly, no dispatch
+    if _focused_target:
+        # Check if focused terminal still exists
+        output_before = capture_pane(_focused_target, 5)
+        if output_before is None or output_before.startswith("[error"):
+            _focused_target = None
+            _focused_project = None
+            await update.message.reply_text("Focused terminal no longer exists. Unfocused.")
+            return
+
+        _focused_last_activity = time.time()
+        send_to_pane(_focused_target, user_msg)
+        await asyncio.sleep(2)
+        output = capture_pane(_focused_target, 15)
+        lines = output.strip().splitlines()
+        trimmed = "\n".join(lines[-8:]) if len(lines) > 8 else output
+        reply = f"[{_focused_project}]\n```\n{trimmed[-2000:]}\n```"
+        try:
+            await update.message.reply_text(reply, parse_mode="Markdown")
+        except Exception:
+            await update.message.reply_text(reply)
+        return
+
+    # Auto mode: dispatch via claude -p
     instances = find_claude_instances()
     if not instances:
         await update.message.reply_text("No active Claude Code sessions found.")
@@ -233,18 +345,22 @@ async def handle_text(update, context):
         send_to_pane(inst["target"], command)
         await asyncio.sleep(3)
 
-    parts = []
+    # Build reply — summary first, raw output only for explicit peek
     if summary:
-        parts.append(summary)
+        reply = summary
+    else:
+        reply = ""
 
-    for num, inst in targets:
-        output = capture_pane(inst["target"], CAPTURE_LINES)
-        max_output = 3000 // len(targets)
-        parts.append(
-            f"\n[#{num} {inst['project']}]\n```\n{output[-max_output:]}\n```"
-        )
+    # Only attach raw terminal output for peek actions or if no summary
+    if action == "peek" or not summary:
+        for num, inst in targets:
+            output = capture_pane(inst["target"], CAPTURE_LINES)
+            # Trim to last 10 lines for mobile readability
+            lines = output.strip().splitlines()
+            trimmed = "\n".join(lines[-10:]) if len(lines) > 10 else output
+            max_output = 2000 // len(targets)
+            reply += f"\n\n[#{num} {inst['project']}]\n```\n{trimmed[-max_output:]}\n```"
 
-    reply = "\n".join(parts)
     if len(reply) > 4000:
         reply = reply[:4000] + "\n...(truncated)"
 
@@ -277,8 +393,8 @@ async def handle_voice(update, context):
         return
 
     await update.message.reply_text(f"Heard: {text}")
-    update.message.text = text
-    await handle_text(update, context)
+    # Process transcribed text as if it were a text message
+    await handle_voice_text(update, context, text)
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +413,8 @@ def main():
     app.add_handler(CommandHandler("list", cmd_list))
     app.add_handler(CommandHandler("peek", cmd_peek))
     app.add_handler(CommandHandler("send", cmd_send))
+    app.add_handler(CommandHandler("focus", cmd_focus))
+    app.add_handler(CommandHandler("unfocus", cmd_unfocus))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_voice))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 

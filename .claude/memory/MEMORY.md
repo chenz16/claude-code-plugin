@@ -1,0 +1,1 @@
+- [Feedback: Remote bot responses](feedback_remote_concise.md) — Telegram bot replies must be short and precise for voice users
