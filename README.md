@@ -19,10 +19,10 @@ Getting voice input and remote access working across Windows, WSL, macOS, and Li
 
 **Solution:** `claude-plugin` auto-detects your platform and picks the right backend. One `pip install` command, one unified CLI. WSL port forwarding is set up automatically. No manual configuration needed.
 
-### 4. Telegram Remote Access Is Slow
-Using a Telegram bot for remote Claude Code control means every message goes through Telegram's servers (overseas), adding 2-10 seconds of latency. Voice messages are even slower.
+### 4. Remote Monitoring — Telegram + Private Web Server
+Developers need to monitor and control Claude Code from their phone while away from the desk. Telegram bot provides quick access from anywhere, but its overseas servers add 2-10 seconds latency — too slow for professional development workflows.
 
-**Solution:** `claude-remote --web` runs a private WebSocket server on your machine. Phone connects directly over LAN — zero cloud latency. Voice recording happens in the browser, SenseVoice runs on your server, results stream back in real-time.
+**Solution:** Two modes for different scenarios. `claude-remote` gives instant Telegram access for casual checks. `claude-remote --web` runs a private WebSocket server for professional use — phone connects directly, zero latency, real-time terminal streaming. Switch between them as needed. Built for developers who need to supervise multiple Claude Code sessions efficiently.
 
 ### 5. Privacy — Everything Should Stay Private
 Cloud-based voice recognition, third-party bots, and public relay servers all mean your code and conversations pass through someone else's infrastructure.
