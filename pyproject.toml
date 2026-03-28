@@ -50,9 +50,13 @@ macos = [
 ]
 
 [project.scripts]
+claude-plugin = "cli:main"
 claude-voice = "voice.cli:main"
 claude-screenshot = "screenshot.cli:main"
 claude-remote = "remote.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["shared*", "voice*", "screenshot*", "remote*"]
+
+[tool.setuptools]
+py-modules = ["cli"]
