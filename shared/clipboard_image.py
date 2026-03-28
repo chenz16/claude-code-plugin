@@ -2,11 +2,11 @@
 Clipboard image detection and screenshot intent recognition.
 
 Detects if user's voice command mentions a screenshot/image,
-grabs the image from clipboard, saves it, and returns the path.
+grabs the image from clipboard or finds the most recent screenshot file.
 """
 
+import glob
 import os
-import re
 import time
 
 SCREENSHOT_KEYWORDS = [
@@ -26,6 +26,23 @@ SCREENSHOT_DIR = "/tmp/claude-screenshots"
 if os.name == "nt":
     SCREENSHOT_DIR = os.path.join(os.environ.get("TEMP", "C:\\Temp"), "claude-screenshots")
 
+# Also search system screenshot folders
+EXTRA_SCREENSHOT_DIRS = []
+if os.name == "nt":
+    # Windows: Screenshots from Win+Shift+S go to clipboard, but
+    # Win+PrintScreen saves to Pictures/Screenshots
+    pictures = os.path.join(os.environ.get("USERPROFILE", ""), "Pictures", "Screenshots")
+    if os.path.isdir(pictures):
+        EXTRA_SCREENSHOT_DIRS.append(pictures)
+    # OneDrive screenshots
+    onedrive = os.environ.get("OneDrive", "")
+    if onedrive:
+        od_screenshots = os.path.join(onedrive, "Pictures", "Screenshots")
+        if os.path.isdir(od_screenshots):
+            EXTRA_SCREENSHOT_DIRS.append(od_screenshots)
+
+MAX_AGE_SECONDS = 120  # Only consider screenshots from last 2 minutes
+
 _counter = 0
 
 
@@ -35,10 +52,9 @@ def has_screenshot_intent(text):
     return any(kw in text_lower for kw in SCREENSHOT_KEYWORDS)
 
 
-def grab_clipboard_image():
-    """Grab image from clipboard. Returns saved file path or None."""
+def _grab_from_clipboard():
+    """Try to grab image directly from clipboard. Returns saved path or None."""
     global _counter
-
     try:
         from PIL import ImageGrab
         img = ImageGrab.grabclipboard()
@@ -53,9 +69,52 @@ def grab_clipboard_image():
 
         img.save(local_path, "PNG")
         size_kb = os.path.getsize(local_path) / 1024
-        print(f"[screenshot] Saved: {filename} ({size_kb:.0f} KB)", flush=True)
+        print(f"[screenshot] Clipboard image saved: {filename} ({size_kb:.0f} KB)", flush=True)
         return local_path
-
-    except Exception as e:
-        print(f"[screenshot] Failed to grab clipboard: {e}", flush=True)
+    except Exception:
         return None
+
+
+def _find_recent_screenshot():
+    """Find the most recent screenshot file (within MAX_AGE_SECONDS).
+    Searches our temp dir and system screenshot folders."""
+    now = time.time()
+    best_path = None
+    best_mtime = 0
+
+    search_dirs = [SCREENSHOT_DIR] + EXTRA_SCREENSHOT_DIRS
+    for d in search_dirs:
+        if not os.path.isdir(d):
+            continue
+        for pattern in ["*.png", "*.jpg", "*.jpeg", "*.bmp"]:
+            for f in glob.glob(os.path.join(d, pattern)):
+                try:
+                    mtime = os.path.getmtime(f)
+                    age = now - mtime
+                    if age <= MAX_AGE_SECONDS and mtime > best_mtime:
+                        best_mtime = mtime
+                        best_path = f
+                except Exception:
+                    continue
+
+    if best_path:
+        age = int(now - best_mtime)
+        print(f"[screenshot] Found recent file ({age}s ago): {os.path.basename(best_path)}", flush=True)
+    return best_path
+
+
+def grab_screenshot():
+    """Get the most relevant screenshot: clipboard first, then recent files.
+    Returns file path or None."""
+    # 1. Try clipboard (image might still be there)
+    path = _grab_from_clipboard()
+    if path:
+        return path
+
+    # 2. Fall back to most recent screenshot file (within 2 minutes)
+    path = _find_recent_screenshot()
+    if path:
+        return path
+
+    print("[screenshot] No screenshot found in clipboard or recent files.", flush=True)
+    return None

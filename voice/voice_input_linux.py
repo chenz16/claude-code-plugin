@@ -223,9 +223,9 @@ def main():
                 print(f"[result] {text}")
 
                 # Check if user mentions a screenshot → grab from clipboard first
-                from shared.clipboard_image import has_screenshot_intent, grab_clipboard_image
+                from shared.clipboard_image import has_screenshot_intent, grab_screenshot
                 if has_screenshot_intent(text):
-                    img_path = grab_clipboard_image()
+                    img_path = grab_screenshot()
                     if img_path:
                         if mode == "remote":
                             send_text_remote(img_path, args.host)
