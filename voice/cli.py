@@ -40,8 +40,8 @@ def main():
             linux_main()
         else:
             # Native Linux
-            if "--host" in sys.argv:
-                # Remote mode: use evdev + arecord (more reliable)
+            if "--host" in sys.argv or "--auto" in sys.argv:
+                # Remote/auto mode: use evdev + arecord (more reliable)
                 from voice.voice_input import main as remote_main
                 remote_main()
             else:
