@@ -480,6 +480,8 @@ async def handle_message(msg, send_fn):
             return
 
         log.info("Voice: %s", text)
+        # Show recognized text on phone as user message
+        await send_fn({"type": "voice_text", "text": text})
         # Process as text (recursive)
         await handle_message({"type": "text", "text": text}, send_fn)
         return
@@ -595,8 +597,16 @@ function connect() {
   };
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
-    if (msg.type === 'waiting') {
-      // Show waiting indicator (will be replaced by reply)
+    if (msg.type === 'voice_text') {
+      // Replace [voice] placeholder with actual recognized text
+      const voiceMsg = document.getElementById('voice-placeholder');
+      if (voiceMsg) {
+        voiceMsg.textContent = msg.text;
+        voiceMsg.removeAttribute('id');
+      } else {
+        addMessage(msg.text, 'user');
+      }
+    } else if (msg.type === 'waiting') {
       const div = document.createElement('div');
       div.className = 'msg bot waiting';
       div.textContent = msg.text;
@@ -604,7 +614,6 @@ function connect() {
       document.getElementById('messages').appendChild(div);
       div.scrollIntoView({ behavior: 'smooth' });
     } else {
-      // Remove waiting message if exists
       const w = document.getElementById('waiting-msg');
       if (w) w.remove();
       addMessage(msg.text, 'bot');
@@ -689,7 +698,12 @@ async function startMic() {
       const reader = new FileReader();
       reader.onload = () => {
         const base64 = reader.result.split(',')[1];
-        addMessage('[voice]', 'user');
+        const div = document.createElement('div');
+        div.className = 'msg user';
+        div.textContent = '识别中...';
+        div.id = 'voice-placeholder';
+        document.getElementById('messages').appendChild(div);
+        div.scrollIntoView({ behavior: 'smooth' });
         ws.send(JSON.stringify({ type: 'audio', data: base64 }));
       };
       reader.readAsDataURL(blob);
@@ -911,6 +925,13 @@ def main():
             "-subj", f"/CN={local_ip}",
             "-addext", f"subjectAltName=IP:{local_ip},IP:127.0.0.1,DNS:localhost",
         ], capture_output=True)
+
+    # Pre-load SenseVoice model for faster first voice request
+    try:
+        from shared.transcribe import load_model
+        load_model()
+    except Exception as e:
+        log.warning("Failed to pre-load voice model: %s", e)
 
     if args.no_ssl:
         print(f"\n  Running in HTTP mode (no SSL)")
