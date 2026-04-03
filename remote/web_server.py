@@ -98,11 +98,17 @@ class RemoteStreamWatcher:
         self._task = None
         self._running = False
         self._last_content = ""
+        self._pending_msg = None  # message we're waiting for a reply to
+        self._replied = True  # True = not waiting for reply
+
+    def expect_reply(self, msg_text):
+        """Mark that we sent a message and are waiting for a reply."""
+        self._pending_msg = msg_text
+        self._replied = False
 
     async def start(self):
         """Start the persistent SSH stream."""
         self._running = True
-        # Capture current content as baseline so we don't replay history
         self._last_content = _remote_capture_pane(self.host, self.session, 20)
         self._task = asyncio.create_task(self._run())
 
@@ -155,49 +161,42 @@ class RemoteStreamWatcher:
                     buffer = []
 
                     if frame != self._last_content and frame.strip():
-                        # Extract new Claude Code reply blocks
-                        from collections import Counter
-                        old = self._last_content.splitlines()
-                        new = frame.splitlines()
+                        # If we're waiting for a reply, find it
+                        if not self._replied and self._pending_msg:
+                            lines = frame.splitlines()
+                            # Find our sent message, then collect ALL ● blocks after it
+                            msg_found = False
+                            all_reply_parts = []
+                            current_block = []
+                            for l in lines:
+                                stripped = l.strip()
+                                if not msg_found:
+                                    if self._pending_msg[:20] in stripped:
+                                        msg_found = True
+                                    continue
+                                # After our message, collect all ● blocks
+                                if stripped.startswith('●'):
+                                    if current_block:
+                                        all_reply_parts.append("\n".join(current_block).strip())
+                                    current_block = [stripped[1:].strip()]
+                                elif current_block:
+                                    if stripped.startswith('❯') or stripped.startswith('⏵') or 'bypass permissions' in stripped.lower() or (stripped and all(c in '─━═' for c in stripped)):
+                                        all_reply_parts.append("\n".join(current_block).strip())
+                                        current_block = []
+                                    elif stripped:
+                                        current_block.append(stripped)
+                            if current_block:
+                                all_reply_parts.append("\n".join(current_block).strip())
 
-                        # Find truly new lines (Counter handles duplicates)
-                        old_counter = Counter(old)
-                        new_lines = []
-                        for l in new:
-                            if old_counter.get(l, 0) > 0:
-                                old_counter[l] -= 1
-                            else:
-                                new_lines.append(l)
+                            if all_reply_parts:
+                                reply_text = "\n\n".join(all_reply_parts).strip()
+                                if reply_text:
+                                    self._replied = True
+                                    try:
+                                        await self.on_output(reply_text[-2000:])
+                                    except Exception:
+                                        pass
 
-                        # Extract reply blocks: ● line + continuation lines
-                        # Skip prompts (❯), separators (───), UI noise
-                        reply_parts = []
-                        in_reply = False
-                        for l in new_lines:
-                            stripped = l.strip()
-                            if not stripped:
-                                if in_reply:
-                                    reply_parts.append('')
-                                continue
-                            if stripped.startswith('●'):
-                                in_reply = True
-                                reply_parts.append(stripped[1:].strip())
-                            elif in_reply:
-                                # Continuation: indented lines, list items, etc.
-                                if stripped.startswith('❯') or stripped.startswith('⏵') or all(c in '─━═' for c in stripped):
-                                    in_reply = False
-                                elif 'bypass permissions' in stripped.lower():
-                                    in_reply = False
-                                else:
-                                    reply_parts.append(stripped)
-
-                        if reply_parts:
-                            reply_text = "\n".join(reply_parts).strip()
-                            if reply_text:
-                                try:
-                                    await self.on_output(reply_text[-2000:])
-                                except Exception:
-                                    pass
                         self._last_content = frame
                 else:
                     buffer.append(line.rstrip("\n"))
@@ -530,6 +529,8 @@ async def handle_message(msg, send_fn):
             return
         elif _focused_host:
             _remote_send_to_pane(_focused_host, _focused_target, f"[M] {text}")
+            if _active_watcher:
+                _active_watcher.expect_reply(text)
         else:
             send_to_pane(_focused_target, f"[M] {text}")
         await send_fn({"type": "waiting", "text": "等待回复..."})
@@ -559,7 +560,8 @@ HTML_PAGE = """<!DOCTYPE html>
 <title>Claude Code</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, system-ui, sans-serif; background: #ededed; color: #111; height: 100vh; display: flex; flex-direction: column; }
+html { overscroll-behavior: none; }
+body { font-family: -apple-system, system-ui, sans-serif; background: #ededed; color: #111; height: 100vh; display: flex; flex-direction: column; overscroll-behavior: none; }
 
 /* ===== Sessions page (friends list) ===== */
 #page-sessions { display: flex; flex-direction: column; height: 100vh; }
@@ -625,17 +627,55 @@ let focusedIdx = null, focusedName = '';
 // Per-session chat history: { idx: [{who, text}] }
 const chatHistory = {};
 
+let reconnectDelay = 1000;
+const MAX_RECONNECT_DELAY = 15000;
+let reconnectTimer = null;
+let connectAttempts = 0;
+let lastConnectTime = 0;
+let hasConnected = false;
+
 function connect() {
+  // Prevent rapid-fire reconnects (anti-flicker guard)
+  const now = Date.now();
+  if (now - lastConnectTime < 500) return;
+  lastConnectTime = now;
+  connectAttempts++;
+
   const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
-  ws = new WebSocket(proto + '//' + location.host + '/ws');
+  try {
+    ws = new WebSocket(proto + '//' + location.host + '/ws');
+  } catch(e) {
+    console.log('WebSocket constructor error:', e);
+    document.getElementById('status').textContent = 'connection failed';
+    return;
+  }
   ws.onopen = () => {
     document.getElementById('status').textContent = 'online';
-    loadSessions();
+    reconnectDelay = 1000;
+    connectAttempts = 0;
+    hasConnected = true;
+    if (focusedIdx) {
+      ws.send(JSON.stringify({type:'text', text:'/focus ' + focusedIdx}));
+    } else {
+      loadSessions();
+    }
   };
   ws.onclose = () => {
-    document.getElementById('status').textContent = 'offline';
-    setTimeout(connect, 2000);
+    // If we never connected successfully and already tried several times,
+    // the cert is likely being rejected for WSS. Stop retrying and show help.
+    if (!hasConnected && connectAttempts >= 3) {
+      document.getElementById('status').innerHTML =
+        'WSS blocked by cert — <a href="' + location.origin + '/ws" target="_blank" ' +
+        'style="color:#fff;text-decoration:underline" ' +
+        'onclick="setTimeout(connect,1000)">tap here to trust</a>';
+      return;
+    }
+    document.getElementById('status').textContent = 'reconnecting...';
+    if (reconnectTimer) clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => { connect(); }, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_RECONNECT_DELAY);
   };
+  ws.onerror = (e) => { console.log('ws error', e); };
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
     if (!focusedIdx) return;
@@ -765,7 +805,7 @@ async function startMic() {
     };
     mediaRecorder.start(); isRecording = true;
     document.getElementById('mic-btn').classList.add('recording');
-  } catch(err) { addMsg('Mic: '+err.message,'bot'); }
+  } catch(err) { addMsg('语音需要 HTTPS 连接','bot'); }
 }
 
 function stopMic() {
@@ -774,6 +814,23 @@ function stopMic() {
   document.getElementById('mic-btn').classList.remove('recording');
   if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
 }
+
+// Prevent accidental page reloads on mobile (pull-to-refresh, etc.)
+document.body.addEventListener('touchmove', function(e) {
+  if (document.scrollingElement.scrollTop === 0) {
+    // Allow scroll in messages area, prevent pull-to-refresh on body
+  }
+}, {passive: true});
+
+// Global error handler to prevent page crashes from causing reloads
+window.onerror = function(msg, url, line) {
+  console.log('JS Error:', msg, url, line);
+  return true;  // prevent default (which might reload)
+};
+window.onunhandledrejection = function(e) {
+  console.log('Unhandled promise rejection:', e.reason);
+  e.preventDefault();
+};
 
 connect();
 </script>
@@ -854,7 +911,7 @@ def main():
                     await send_fn({"type": "text", "text": f"Error: {e}"})
         except WebSocketDisconnect:
             state["connected"] = False
-            # Stop stream watcher on disconnect
+            # Keep focus state for reconnection, just stop watcher
             global _active_watcher
             if _active_watcher:
                 await _active_watcher.stop()
@@ -965,12 +1022,31 @@ def main():
         os.makedirs(cert_dir, exist_ok=True)
         log.info("Generating self-signed certificate for HTTPS...")
         import subprocess as _sp2
+
+        # Use an OpenSSL config file for SAN (more compatible than -addext)
+        san_conf = os.path.join(cert_dir, "san.cnf")
+        with open(san_conf, "w") as f:
+            f.write(f"""[req]
+default_bits = 2048
+prompt = no
+default_md = sha256
+distinguished_name = dn
+x509_extensions = v3_req
+
+[dn]
+CN = {local_ip}
+
+[v3_req]
+subjectAltName = IP:{local_ip},IP:127.0.0.1,DNS:localhost
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+""")
         _sp2.run([
             "openssl", "req", "-x509", "-newkey", "rsa:2048",
             "-keyout", key_file, "-out", cert_file,
             "-days", "365", "-nodes",
-            "-subj", f"/CN={local_ip}",
-            "-addext", f"subjectAltName=IP:{local_ip},IP:127.0.0.1,DNS:localhost",
+            "-config", san_conf,
         ], capture_output=True)
 
     # Pre-load SenseVoice model for faster first voice request
