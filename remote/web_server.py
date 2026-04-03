@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from shared.tmux_utils import find_claude_instances, capture_pane, send_to_pane
 from shared.config import CAPTURE_LINES
+from shared.ssh_remote import test_ssh, list_remote_sessions, send_to_remote_tmux
 
 logging.basicConfig(format="%(asctime)s [%(levelname)s] %(message)s", level=logging.INFO)
 log = logging.getLogger(__name__)
@@ -31,8 +32,103 @@ log = logging.getLogger(__name__)
 # Focused terminal state
 _focused_target = None
 _focused_project = None
+_focused_host = None  # None = local, "user@host" = remote
 _focused_last_activity = 0
 FOCUS_TIMEOUT = 1800  # auto-unfocus after 30 minutes of inactivity
+
+# Remote hosts discovered via SSH
+_remote_hosts = {}  # ip -> user@host
+
+
+def _scan_ssh_hosts():
+    """Discover active SSH connections."""
+    hosts = {}
+    try:
+        import subprocess
+        ret = subprocess.run(["pgrep", "-a", "ssh"],
+                             capture_output=True, text=True, timeout=3)
+        for line in ret.stdout.strip().splitlines():
+            parts = line.split()
+            for part in parts[1:]:
+                if "@" in part and not part.startswith("-") and "/" not in part and not part.startswith("["):
+                    ip = part.split("@")[-1]
+                    if ip and not ip.startswith("-"):
+                        hosts[ip] = part
+    except Exception:
+        pass
+    return hosts
+
+
+def _remote_capture_pane(host, session, lines=40):
+    """Capture tmux pane output on a remote host via SSH."""
+    import subprocess
+    try:
+        ret = subprocess.run(
+            ["ssh", host, f"tmux capture-pane -t {session} -p -S -{lines}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return ret.stdout
+    except Exception:
+        return ""
+
+
+def _remote_send_to_pane(host, session, text, press_enter=True):
+    """Send text to a remote tmux pane via SSH."""
+    import subprocess
+    escaped = text.replace("\\", "\\\\").replace("'", "'\\''").replace(";", "\\;")
+    enter_part = " Enter" if press_enter else ""
+    cmd = f"ssh {host} \"tmux send-keys -t {session} '{escaped}'{enter_part}\""
+    subprocess.run(cmd, shell=True, capture_output=True, timeout=10)
+
+
+def _local_paste(text):
+    """Send text to the most recently active local Claude Code terminal.
+    Finds Claude Code processes, checks their pts mtime, writes to the most recent one."""
+    import subprocess
+    import fcntl
+    import termios
+
+    # Find all claude processes and their pts
+    ret = subprocess.run(
+        ["ps", "-eo", "pid,tty,args", "--no-headers"],
+        capture_output=True, text=True, timeout=3,
+    )
+    best_time = 0
+    best_pts = None
+    for line in ret.stdout.strip().splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, tty, cmd = parts
+        if "claude" not in cmd.lower() or tty == "?" or "web_server" in cmd or "voice" in cmd or "screenshot" in cmd:
+            continue
+        if not tty.startswith("pts/"):
+            continue
+        pts_path = f"/dev/{tty}"
+        try:
+            mtime = os.stat(pts_path).st_mtime
+            if mtime > best_time:
+                best_time = mtime
+                best_pts = pts_path
+        except OSError:
+            continue
+
+    if not best_pts:
+        log.warning("No local Claude Code terminal found")
+        return
+
+    # Write text to the pts using TIOCSTI (terminal input simulation)
+    try:
+        with open(best_pts, 'w') as fd:
+            for char in text:
+                fcntl.ioctl(fd, termios.TIOCSTI, char.encode())
+        log.info("Local paste to %s: %s", best_pts, text[:50])
+    except PermissionError:
+        # TIOCSTI might be disabled, fall back to xdotool
+        log.warning("TIOCSTI failed, falling back to xdotool")
+        subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode(), timeout=5)
+        import time as _t; _t.sleep(0.05)
+        subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"], timeout=5)
 
 
 def clean_terminal_output(text):
@@ -55,20 +151,64 @@ def clean_terminal_output(text):
         # Skip spinner/progress lines
         if '██' in stripped or '▓▓' in stripped or '░░' in stripped:
             continue
+        # Skip Claude Code UI elements
+        if 'bypass permissions' in stripped.lower():
+            continue
+        if 'shift+tab to cycle' in stripped.lower():
+            continue
+        if stripped.startswith('print(') or stripped.startswith('❯') or stripped == '❯':
+            continue
+        if stripped in ('⏵⏵', '⏵', '›'):
+            continue
         cleaned.append(stripped)
     return "\n".join(cleaned)
 
 
 def get_instances_info():
-    """Get list of active Claude Code sessions."""
-    instances = find_claude_instances()
-    return [{"idx": i + 1, "project": inst["project"], "cwd": inst["cwd"], "target": inst["target"]}
-            for i, inst in enumerate(instances)]
+    """Get list of active Claude Code sessions (local + remote)."""
+    instances = []
+
+    # Local tmux sessions
+    for inst in find_claude_instances():
+        instances.append({
+            "project": inst["project"],
+            "cwd": inst["cwd"],
+            "target": inst["target"],
+            "host": None,  # local
+        })
+
+    # Remote tmux sessions
+    for ip, host_str in _remote_hosts.items():
+        try:
+            sessions = list_remote_sessions(host_str)
+            for sess in sessions:
+                instances.append({
+                    "project": f"{sess}@{ip}",
+                    "cwd": host_str,
+                    "target": sess,
+                    "host": host_str,
+                })
+        except Exception:
+            pass
+
+    # Add "Local Paste" option at the end
+    instances.append({
+        "project": "Local Paste",
+        "cwd": "paste to focused window",
+        "target": "__local_paste__",
+        "host": "__local__",
+    })
+
+    # Add index
+    for i, inst in enumerate(instances):
+        inst["idx"] = i + 1
+
+    return instances
 
 
 async def handle_message(msg, send_fn):
     """Process incoming message and send responses via send_fn."""
-    global _focused_target, _focused_project, _focused_last_activity
+    global _focused_target, _focused_project, _focused_host, _focused_last_activity
 
     msg_type = msg.get("type", "text")
     text = msg.get("text", "").strip()
@@ -85,8 +225,12 @@ async def handle_message(msg, send_fn):
             else:
                 lines = []
                 for inst in instances:
-                    output = capture_pane(inst["target"], 3)
-                    last = output.strip().splitlines()[-1][:60] if output.strip() else "(empty)"
+                    if inst.get("host"):
+                        output = _remote_capture_pane(inst["host"], inst["target"], 3)
+                    else:
+                        output = capture_pane(inst["target"], 3)
+                    cleaned = clean_terminal_output(output)
+                    last = cleaned.splitlines()[-1][:60] if cleaned else "(empty)"
                     lines.append(f"#{inst['idx']} {inst['project']}\n  {last}")
                 await send_fn({"type": "text", "text": "\n\n".join(lines)})
             return
@@ -104,33 +248,42 @@ async def handle_message(msg, send_fn):
                 return
             _focused_target = inst["target"]
             _focused_project = inst["project"]
+            _focused_host = inst["host"]
             _focused_last_activity = time.time()
-            output = capture_pane(_focused_target, 5)
-            lines = output.strip().splitlines()[-3:] if output.strip() else []
+            if _focused_host:
+                output = _remote_capture_pane(_focused_host, _focused_target, 5)
+            else:
+                output = capture_pane(_focused_target, 5)
+            cleaned = clean_terminal_output(output)
+            lines = cleaned.splitlines()[-3:] if cleaned else []
             await send_fn({"type": "text", "text": f"Focused on [{_focused_project}]\n" + "\n".join(lines)})
             return
 
         elif cmd == "/unfocus":
             _focused_target = None
             _focused_project = None
+            _focused_host = None
             await send_fn({"type": "text", "text": "Unfocused."})
             return
 
         elif cmd == "/peek":
             target = _focused_target
-            project = _focused_project
+            host = _focused_host
             if len(parts) > 1:
                 instances = get_instances_info()
                 try:
                     idx = int(parts[1]) - 1
                     target = instances[idx]["target"]
-                    project = instances[idx]["project"]
+                    host = instances[idx]["host"]
                 except (IndexError, ValueError):
                     pass
             if not target:
                 await send_fn({"type": "text", "text": "No terminal. Use /focus first or /peek <n>"})
                 return
-            output = capture_pane(target, CAPTURE_LINES)
+            if host:
+                output = _remote_capture_pane(host, target, CAPTURE_LINES)
+            else:
+                output = capture_pane(target, CAPTURE_LINES)
             await send_fn({"type": "text", "text": clean_terminal_output(output)[-3000:]})
             return
 
@@ -145,9 +298,14 @@ async def handle_message(msg, send_fn):
             except (IndexError, ValueError):
                 await send_fn({"type": "text", "text": "Usage: /send <n> <text>"})
                 return
-            send_to_pane(inst["target"], command)
-            await asyncio.sleep(2)
-            output = capture_pane(inst["target"], 10)
+            if inst["host"]:
+                _remote_send_to_pane(inst["host"], inst["target"], command)
+                await asyncio.sleep(2)
+                output = _remote_capture_pane(inst["host"], inst["target"], 10)
+            else:
+                send_to_pane(inst["target"], command)
+                await asyncio.sleep(2)
+                output = capture_pane(inst["target"], 10)
             await send_fn({"type": "text", "text": clean_terminal_output(output)[-1500:]})
             return
 
@@ -193,44 +351,69 @@ async def handle_message(msg, send_fn):
         if time.time() - _focused_last_activity > FOCUS_TIMEOUT:
             _focused_target = None
             _focused_project = None
-            await send_fn({"type": "text", "text": "Auto-unfocused (idle > 5min)."})
+            _focused_host = None
+            await send_fn({"type": "text", "text": "Auto-unfocused (idle > 30min)."})
             return
 
         _focused_last_activity = time.time()
-        send_to_pane(_focused_target, f"[M] {text}")
+        if _focused_host == "__local__":
+            _local_paste(text)
+        elif _focused_host:
+            _remote_send_to_pane(_focused_host, _focused_target, f"[M] {text}")
+        else:
+            send_to_pane(_focused_target, f"[M] {text}")
         await send_fn({"type": "text", "text": "Sent."})
+
+        # No polling for local paste mode
+        if _focused_host == "__local__":
+            return
 
         # Poll in background — stream new output incrementally
         async def poll_result():
             target = _focused_target
+            host = _focused_host
             if not target:
                 return
-            await asyncio.sleep(2)
-            last_output = capture_pane(target, 20)
+
+            def _capture(lines=20):
+                if host:
+                    return _remote_capture_pane(host, target, lines)
+                return capture_pane(target, lines)
+
+            # Capture immediately before the response arrives
+            baseline = _capture(20)
             stable_count = 0
-            for _ in range(90):  # max ~3 minutes
-                await asyncio.sleep(2)
-                output = capture_pane(target, 20)
-                if output == last_output:
-                    stable_count += 1
-                    if stable_count >= 3:  # stable 6s = done
-                        break
-                else:
-                    # New output — send the diff
-                    old_lines = set(last_output.splitlines())
-                    new_lines = [l for l in output.splitlines() if l not in old_lines]
-                    if new_lines:
-                        cleaned = clean_terminal_output("\n".join(new_lines[-5:]))
-                        if cleaned.strip():
-                            await send_fn({"type": "text", "text": cleaned[-1000:]})
-                    stable_count = 0
-                    last_output = output
-            # Final summary
-            cleaned = clean_terminal_output(capture_pane(target, 10))
-            lines = cleaned.splitlines()[-5:]
-            final = "\n".join(lines)
-            if final.strip():
-                await send_fn({"type": "text", "text": final[-1000:]})
+            for _ in range(360):  # max ~3 minutes
+                await asyncio.sleep(0.5)
+                output = _capture(20)
+                if output == baseline:
+                    # Nothing changed yet, keep waiting
+                    continue
+                # Something changed — send the new content
+                old_lines = set(baseline.splitlines())
+                new_lines = [l for l in output.splitlines() if l not in old_lines]
+                if new_lines:
+                    cleaned = clean_terminal_output("\n".join(new_lines))
+                    if cleaned.strip():
+                        await send_fn({"type": "text", "text": cleaned[-1000:]})
+                # Now check for stability (response done)
+                last_output = output
+                for _ in range(60):  # wait up to 30s for more output
+                    await asyncio.sleep(0.5)
+                    output = _capture(20)
+                    if output != last_output:
+                        old2 = set(last_output.splitlines())
+                        new2 = [l for l in output.splitlines() if l not in old2]
+                        if new2:
+                            cleaned = clean_terminal_output("\n".join(new2))
+                            if cleaned.strip():
+                                await send_fn({"type": "text", "text": cleaned[-1000:]})
+                        last_output = output
+                    else:
+                        stable_count += 1
+                        if stable_count >= 2:
+                            break
+                break
 
         asyncio.create_task(poll_result())
         return
@@ -261,6 +444,15 @@ HTML_PAGE = """<!DOCTYPE html>
 body { font-family: -apple-system, system-ui, sans-serif; background: #1a1a2e; color: #eee; height: 100vh; display: flex; flex-direction: column; }
 #header { background: #16213e; padding: 12px 16px; font-size: 16px; font-weight: 600; border-bottom: 1px solid #333; }
 #status { font-size: 11px; color: #4CAF50; margin-top: 2px; }
+#focused-bar { background: #0f3460; padding: 10px 16px; border-bottom: 1px solid #333; display: none; cursor: pointer; }
+#focused-bar .label { font-size: 14px; font-weight: 600; color: #4CAF50; }
+#focused-bar .hint { font-size: 11px; color: #888; }
+#session-panel { background: #16213e; border-bottom: 1px solid #333; padding: 8px; max-height: 50vh; overflow-y: auto; }
+.session-item { padding: 14px; margin: 6px 0; background: #2a2a4a; border-radius: 8px; cursor: pointer; border: 2px solid transparent; }
+.session-item:active { background: #3a3a5a; }
+.session-item.active { border-color: #4CAF50; }
+.session-name { font-size: 15px; font-weight: 600; }
+.session-host { font-size: 12px; color: #888; margin-top: 4px; }
 #messages { flex: 1; overflow-y: auto; padding: 12px; }
 .msg { margin-bottom: 10px; padding: 8px 12px; border-radius: 8px; max-width: 90%; word-wrap: break-word; white-space: pre-wrap; font-size: 14px; line-height: 1.4; }
 .msg.user { background: #0f3460; margin-left: auto; }
@@ -269,7 +461,8 @@ body { font-family: -apple-system, system-ui, sans-serif; background: #1a1a2e; c
 #input-area { background: #16213e; padding: 10px; border-top: 1px solid #333; display: flex; gap: 8px; align-items: center; }
 #text-input { flex: 1; padding: 10px; border-radius: 20px; border: 1px solid #444; background: #1a1a2e; color: #eee; font-size: 15px; outline: none; }
 #text-input:focus { border-color: #4CAF50; }
-button { border: none; border-radius: 50%; width: 56px; height: 56px; cursor: pointer; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
+button { border: none; cursor: pointer; -webkit-tap-highlight-color: transparent; border-radius: 0; width: auto; height: auto; }
+.round-btn { border-radius: 50% !important; width: 56px !important; height: 56px !important; display: flex; align-items: center; justify-content: center; }
 #send-btn { background: #4CAF50; color: white; font-size: 22px; min-width: 56px; }
 #mic-btn { background: #e53935; color: white; font-size: 26px; min-width: 56px; }
 #mic-btn.recording { background: #f44336; animation: pulse 1s infinite; }
@@ -281,11 +474,16 @@ button { border: none; border-radius: 50%; width: 56px; height: 56px; cursor: po
   Claude Code Remote
   <div id="status">connecting...</div>
 </div>
+<div id="focused-bar" onclick="showSessions()">
+  <span class="label" id="focused-name"></span>
+  <span class="hint"> (tap to switch)</span>
+</div>
+<div id="session-panel"></div>
 <div id="messages"></div>
 <div id="input-area">
-  <button id="mic-btn" ontouchstart="event.preventDefault();startMic()" ontouchend="event.preventDefault();stopMic()" onmousedown="startMic()" onmouseup="stopMic()">🎤</button>
+  <button id="mic-btn" class="round-btn" ontouchstart="event.preventDefault();startMic()" ontouchend="event.preventDefault();stopMic()" onmousedown="startMic()" onmouseup="stopMic()">🎤</button>
   <input id="text-input" placeholder="Type or use voice..." onkeydown="if(event.key==='Enter')sendText()">
-  <button id="send-btn" ontouchstart="event.preventDefault();sendText()" onclick="sendText()">→</button>
+  <button id="send-btn" class="round-btn" ontouchstart="event.preventDefault();sendText()" onclick="sendText()">→</button>
 </div>
 
 <script>
@@ -293,13 +491,17 @@ let ws;
 let mediaRecorder;
 let audioChunks = [];
 let isRecording = false;
+let focusedIdx = null;
 
 function connect() {
   const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
   ws = new WebSocket(proto + '//' + location.host + '/ws');
-  ws.onopen = () => { document.getElementById('status').textContent = 'connected'; };
+  ws.onopen = () => {
+    document.getElementById('status').textContent = 'connected';
+    showSessions();
+  };
   ws.onclose = () => {
-    document.getElementById('status').textContent = 'disconnected - reconnecting...';
+    document.getElementById('status').textContent = 'reconnecting...';
     setTimeout(connect, 2000);
   };
   ws.onmessage = (e) => {
@@ -321,7 +523,7 @@ function sendText() {
   const text = input.value.trim();
   if (!text) return;
   if (!ws || ws.readyState !== WebSocket.OPEN) {
-    addMessage('[Not connected - reconnecting...]', 'bot');
+    addMessage('[Not connected]', 'bot');
     connect();
     return;
   }
@@ -331,6 +533,43 @@ function sendText() {
   input.focus();
 }
 
+// Sessions panel
+async function showSessions() {
+  const panel = document.getElementById('session-panel');
+  panel.style.display = 'block';
+  panel.innerHTML = '<div style="padding:12px;color:#888">Loading...</div>';
+  try {
+    const resp = await fetch('/api/sessions');
+    const sessions = await resp.json();
+    if (sessions.length === 0) {
+      panel.innerHTML = '<div style="padding:12px;color:#888">No sessions found</div>';
+      return;
+    }
+    panel.innerHTML = '<div style="padding:4px 8px;color:#888;font-size:12px">Select a session:</div>' +
+      sessions.map(s => {
+        const isActive = focusedIdx === s.idx;
+        const hostLabel = s.host ? s.host : 'local';
+        return '<div class="session-item' + (isActive ? ' active' : '') + '" onclick="focusSession(' + s.idx + ',\\x27' + s.project + '\\x27)">' +
+          '<div class="session-name">#' + s.idx + ' ' + s.project + '</div>' +
+          '<div class="session-host">' + hostLabel + '</div>' +
+          '</div>';
+      }).join('');
+  } catch (e) {
+    panel.innerHTML = '<div style="padding:12px;color:#f44336">Failed to load sessions</div>';
+  }
+}
+
+function focusSession(idx, name) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  focusedIdx = idx;
+  ws.send(JSON.stringify({ type: 'text', text: '/focus ' + idx }));
+  // Hide panel, show focused bar
+  document.getElementById('session-panel').style.display = 'none';
+  document.getElementById('focused-bar').style.display = 'block';
+  document.getElementById('focused-name').textContent = '#' + idx + ' ' + name;
+}
+
+// Mic
 let micStream = null;
 
 async function startMic() {
@@ -384,6 +623,7 @@ def main():
     parser = argparse.ArgumentParser(description="Claude Code local web remote")
     parser.add_argument("--host", default="0.0.0.0", help="Bind address (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=8080, help="Port (default: 8080)")
+    parser.add_argument("--no-ssl", action="store_true", help="Disable HTTPS (for local debugging)")
     args = parser.parse_args()
 
     try:
@@ -400,6 +640,16 @@ def main():
     @app.get("/")
     async def index():
         return HTMLResponse(HTML_PAGE)
+
+    @app.get("/api/sessions")
+    async def api_sessions():
+        from fastapi.responses import JSONResponse
+        instances = get_instances_info()
+        return JSONResponse([{
+            "idx": inst["idx"],
+            "project": inst["project"],
+            "host": inst.get("host"),
+        } for inst in instances])
 
     @app.get("/manifest.json")
     async def manifest():
@@ -494,6 +744,17 @@ def main():
         except Exception:
             pass
 
+    # Auto-discover remote SSH hosts
+    global _remote_hosts
+    _remote_hosts = _scan_ssh_hosts()
+    for ip, host_str in list(_remote_hosts.items()):
+        if test_ssh(host_str):
+            sessions = list_remote_sessions(host_str)
+            log.info("Remote %s: %s", host_str, ", ".join(sessions) if sessions else "no sessions")
+        else:
+            del _remote_hosts[ip]
+            log.warning("Remote %s: SSH failed, skipping", host_str)
+
     url = f"https://{local_ip}:{args.port}"
     print("")
     print("=" * 50)
@@ -522,7 +783,17 @@ def main():
     cert_file = os.path.join(cert_dir, "cert.pem")
     key_file = os.path.join(cert_dir, "key.pem")
 
-    if not os.path.exists(cert_file):
+    # Regenerate cert if IP changed or cert doesn't exist
+    regen = not os.path.exists(cert_file)
+    if os.path.exists(cert_file):
+        # Check if cert matches current IP
+        import subprocess as _sp2
+        ret = _sp2.run(["openssl", "x509", "-in", cert_file, "-text", "-noout"],
+                       capture_output=True, text=True, timeout=5)
+        if local_ip not in ret.stdout:
+            regen = True
+
+    if regen:
         os.makedirs(cert_dir, exist_ok=True)
         log.info("Generating self-signed certificate for HTTPS...")
         import subprocess as _sp2
@@ -531,15 +802,18 @@ def main():
             "-keyout", key_file, "-out", cert_file,
             "-days", "365", "-nodes",
             "-subj", f"/CN={local_ip}",
-            "-addext", f"subjectAltName=IP:{local_ip}",
+            "-addext", f"subjectAltName=IP:{local_ip},IP:127.0.0.1,DNS:localhost",
         ], capture_output=True)
 
-    print(f"\n  NOTE: First time on phone, accept the security warning")
-    print(f"  (self-signed certificate is safe on your private network)")
-    print("", flush=True)
-
-    uvicorn.run(app, host=args.host, port=args.port, log_level="warning",
-                ssl_certfile=cert_file, ssl_keyfile=key_file)
+    if args.no_ssl:
+        print(f"\n  Running in HTTP mode (no SSL)")
+        print("", flush=True)
+        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    else:
+        print(f"\n  NOTE: First time, accept the security warning in browser")
+        print("", flush=True)
+        uvicorn.run(app, host=args.host, port=args.port, log_level="warning",
+                    ssl_certfile=cert_file, ssl_keyfile=key_file)
 
 
 if __name__ == "__main__":

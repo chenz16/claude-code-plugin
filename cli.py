@@ -76,9 +76,19 @@ def _start_all():
 
     print("=" * 50)
     print("  Claude Code Plugin")
-    print("  Starting voice input + screenshot monitor...")
+    print("  Starting voice + screenshot + web server...")
     print("=" * 50)
     print("", flush=True)
+
+    # Start web server as a separate process (uvicorn needs its own event loop)
+    import subprocess as _sp
+    import atexit
+    web_proc = _sp.Popen(
+        [sys.executable, "-m", "remote.web_server", "--no-ssl"],
+        stdout=None, stderr=None,
+    )
+    print(f"  [web] Started (PID {web_proc.pid})", flush=True)
+    atexit.register(lambda: web_proc.terminate())
 
     # Start screenshot monitor in background thread
     def run_screenshot():

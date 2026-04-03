@@ -371,34 +371,41 @@ def on_new_screenshot(img):
     print(f"\n  New screenshot detected!", flush=True)
     local_path = save_screenshot(img)
 
+    sent_remote = False
+
     if args.host:
         # Explicit host mode
         handle_remote(local_path, args.host)
+        sent_remote = True
     elif args.wsl:
         handle_wsl(local_path)
-    elif IS_LINUX and _terminal_pid:
-        # Linux: pts-based auto-detection
-        mode, host = detect_active_target()
-        if mode == "remote" and host:
-            print(f"  [auto] Active tab -> {host}", flush=True)
-            handle_remote(local_path, host)
+        sent_remote = True
+    elif IS_LINUX:
+        if _terminal_pid:
+            # pts-based auto-detection
+            mode, host = detect_active_target()
+            if mode == "remote" and host:
+                print(f"  [auto] Active tab -> {host}", flush=True)
+                handle_remote(local_path, host)
+                sent_remote = True
+            else:
+                print(f"  [auto] Active tab -> LOCAL", flush=True)
+                handle_local(local_path)
         else:
-            print(f"  [auto] Active tab -> LOCAL", flush=True)
+            # No terminal PID (e.g. running from start command)
+            # Default to local paste
+            print(f"  [auto] No terminal PID, -> LOCAL", flush=True)
             handle_local(local_path)
     else:
         # Windows/macOS fallback
         if IS_WIN and check_wsl_tmux():
             handle_wsl(local_path)
+            sent_remote = True
         else:
-            ssh_hosts = scan_ssh_connections()
-            if len(ssh_hosts) == 1:
-                host = list(ssh_hosts.values())[0]
-                print(f"  Auto-detected: SSH to {host}", flush=True)
-                handle_remote(local_path, host)
-            else:
-                handle_local(local_path)
+            handle_local(local_path)
 
-    if args.cleanup and os.path.exists(local_path):
+    # Only cleanup if sent to remote (local needs the file for Claude Code to read)
+    if sent_remote and args.cleanup and os.path.exists(local_path):
         os.remove(local_path)
 
 
