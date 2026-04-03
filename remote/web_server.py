@@ -60,7 +60,7 @@ def _scan_ssh_hosts():
 
 
 def _remote_capture_pane(host, session, lines=40):
-    """Capture tmux pane output on a remote host via SSH."""
+    """Capture tmux pane output on a remote host via SSH (one-shot)."""
     import subprocess
     try:
         ret = subprocess.run(
@@ -79,6 +79,117 @@ def _remote_send_to_pane(host, session, text, press_enter=True):
     enter_part = " Enter" if press_enter else ""
     cmd = f"ssh {host} \"tmux send-keys -t {session} '{escaped}'{enter_part}\""
     subprocess.run(cmd, shell=True, capture_output=True, timeout=10)
+
+
+class RemoteStreamWatcher:
+    """Persistent SSH connection that continuously captures tmux output.
+
+    Instead of polling with a new SSH call each time, keeps one SSH
+    connection open running a capture loop on the remote side.
+    Output changes are detected and pushed via callback.
+    """
+
+    def __init__(self, host, session, on_output, interval=0.3):
+        self.host = host
+        self.session = session
+        self.on_output = on_output  # async callback(text)
+        self.interval = interval
+        self._proc = None
+        self._task = None
+        self._running = False
+        self._last_content = ""
+
+    async def start(self):
+        """Start the persistent SSH stream."""
+        self._running = True
+        # Capture current content as baseline so we don't replay history
+        self._last_content = _remote_capture_pane(self.host, self.session, 20)
+        self._task = asyncio.create_task(self._run())
+
+    async def stop(self):
+        """Stop the stream and kill SSH process."""
+        self._running = False
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc = None
+            except Exception:
+                pass
+        if self._task:
+            self._task.cancel()
+            self._task = None
+
+    async def _run(self):
+        """Main loop: one persistent SSH connection, remote-side capture loop."""
+        import subprocess
+
+        # Remote command: loop capturing tmux pane, separated by markers
+        remote_cmd = (
+            f"while true; do "
+            f"tmux capture-pane -t {self.session} -p -S -20 2>/dev/null; "
+            f"echo '@@__FRAME__@@'; "
+            f"sleep {self.interval}; "
+            f"done"
+        )
+
+        try:
+            self._proc = subprocess.Popen(
+                ["ssh", self.host, remote_cmd],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+
+            buffer = []
+            loop = asyncio.get_event_loop()
+
+            while self._running and self._proc and self._proc.poll() is None:
+                # Read line by line in a thread to not block event loop
+                line = await loop.run_in_executor(None, self._proc.stdout.readline)
+                if not line:
+                    break
+
+                if line.strip() == "@@__FRAME__@@":
+                    # Got a complete frame
+                    frame = "\n".join(buffer)
+                    buffer = []
+
+                    if frame != self._last_content and frame.strip():
+                        # Extract only Claude Code reply lines (start with ●)
+                        old_lines = set(self._last_content.splitlines())
+                        new_replies = []
+                        for l in frame.splitlines():
+                            if l not in old_lines:
+                                stripped = l.strip()
+                                # Only keep actual reply content (● lines)
+                                if stripped.startswith('●'):
+                                    new_replies.append(stripped[1:].strip())
+                        if new_replies:
+                            reply_text = "\n".join(new_replies)
+                            if reply_text.strip():
+                                try:
+                                    await self.on_output(reply_text[-1000:])
+                                except Exception:
+                                    pass
+                        self._last_content = frame
+                else:
+                    buffer.append(line.rstrip("\n"))
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            log.error("StreamWatcher error: %s", e)
+        finally:
+            if self._proc:
+                try:
+                    self._proc.terminate()
+                except Exception:
+                    pass
+                self._proc = None
+
+
+# Active stream watcher (one per focused session)
+_active_watcher = None
 
 
 def _local_paste(text):
@@ -160,6 +271,11 @@ def clean_terminal_output(text):
             continue
         if stripped in ('⏵⏵', '⏵', '›'):
             continue
+        # Skip spinner/loading lines (e.g. "* Tinkering...", "+ Zesting...")
+        if '...' in stripped and len(stripped) < 30:
+            # Short line ending with ... and starting with a non-letter = spinner
+            if stripped[0] not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789':
+                continue
         cleaned.append(stripped)
     return "\n".join(cleaned)
 
@@ -236,6 +352,7 @@ async def handle_message(msg, send_fn):
             return
 
         elif cmd == "/focus":
+            global _active_watcher
             instances = get_instances_info()
             if not instances:
                 await send_fn({"type": "text", "text": "No active sessions."})
@@ -246,20 +363,42 @@ async def handle_message(msg, send_fn):
             except (IndexError, ValueError):
                 await send_fn({"type": "text", "text": f"Usage: /focus <1-{len(instances)}>"})
                 return
+
+            # Stop previous watcher
+            if _active_watcher:
+                await _active_watcher.stop()
+                _active_watcher = None
+
             _focused_target = inst["target"]
             _focused_project = inst["project"]
             _focused_host = inst["host"]
             _focused_last_activity = time.time()
-            if _focused_host:
+
+            if _focused_host and _focused_host != "__local__":
                 output = _remote_capture_pane(_focused_host, _focused_target, 5)
-            else:
+            elif not _focused_host:
                 output = capture_pane(_focused_target, 5)
+            else:
+                output = ""
             cleaned = clean_terminal_output(output)
             lines = cleaned.splitlines()[-3:] if cleaned else []
             await send_fn({"type": "text", "text": f"Focused on [{_focused_project}]\n" + "\n".join(lines)})
+
+            # Start persistent stream watcher for remote sessions
+            if _focused_host and _focused_host != "__local__":
+                _active_watcher = RemoteStreamWatcher(
+                    _focused_host, _focused_target,
+                    on_output=lambda text: send_fn({"type": "text", "text": text}),
+                    interval=0.3,
+                )
+                await _active_watcher.start()
+                log.info("Started stream watcher for %s:%s", _focused_host, _focused_target)
             return
 
         elif cmd == "/unfocus":
+            if _active_watcher:
+                await _active_watcher.stop()
+                _active_watcher = None
             _focused_target = None
             _focused_project = None
             _focused_host = None
@@ -358,64 +497,14 @@ async def handle_message(msg, send_fn):
         _focused_last_activity = time.time()
         if _focused_host == "__local__":
             _local_paste(text)
+            await send_fn({"type": "text", "text": "已粘贴到本地窗口"})
+            return
         elif _focused_host:
             _remote_send_to_pane(_focused_host, _focused_target, f"[M] {text}")
         else:
             send_to_pane(_focused_target, f"[M] {text}")
-        await send_fn({"type": "text", "text": "Sent."})
-
-        # No polling for local paste mode
-        if _focused_host == "__local__":
-            return
-
-        # Poll in background — stream new output incrementally
-        async def poll_result():
-            target = _focused_target
-            host = _focused_host
-            if not target:
-                return
-
-            def _capture(lines=20):
-                if host:
-                    return _remote_capture_pane(host, target, lines)
-                return capture_pane(target, lines)
-
-            # Capture immediately before the response arrives
-            baseline = _capture(20)
-            stable_count = 0
-            for _ in range(360):  # max ~3 minutes
-                await asyncio.sleep(0.5)
-                output = _capture(20)
-                if output == baseline:
-                    # Nothing changed yet, keep waiting
-                    continue
-                # Something changed — send the new content
-                old_lines = set(baseline.splitlines())
-                new_lines = [l for l in output.splitlines() if l not in old_lines]
-                if new_lines:
-                    cleaned = clean_terminal_output("\n".join(new_lines))
-                    if cleaned.strip():
-                        await send_fn({"type": "text", "text": cleaned[-1000:]})
-                # Now check for stability (response done)
-                last_output = output
-                for _ in range(60):  # wait up to 30s for more output
-                    await asyncio.sleep(0.5)
-                    output = _capture(20)
-                    if output != last_output:
-                        old2 = set(last_output.splitlines())
-                        new2 = [l for l in output.splitlines() if l not in old2]
-                        if new2:
-                            cleaned = clean_terminal_output("\n".join(new2))
-                            if cleaned.strip():
-                                await send_fn({"type": "text", "text": cleaned[-1000:]})
-                        last_output = output
-                    else:
-                        stable_count += 1
-                        if stable_count >= 2:
-                            break
-                break
-
-        asyncio.create_task(poll_result())
+        await send_fn({"type": "waiting", "text": "等待回复..."})
+        # Stream watcher handles output automatically
         return
 
     # No focus — just show status
@@ -506,7 +595,20 @@ function connect() {
   };
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
-    addMessage(msg.text, 'bot');
+    if (msg.type === 'waiting') {
+      // Show waiting indicator (will be replaced by reply)
+      const div = document.createElement('div');
+      div.className = 'msg bot waiting';
+      div.textContent = msg.text;
+      div.id = 'waiting-msg';
+      document.getElementById('messages').appendChild(div);
+      div.scrollIntoView({ behavior: 'smooth' });
+    } else {
+      // Remove waiting message if exists
+      const w = document.getElementById('waiting-msg');
+      if (w) w.remove();
+      addMessage(msg.text, 'bot');
+    }
   };
 }
 
@@ -691,6 +793,11 @@ def main():
                     await send_fn({"type": "text", "text": f"Error: {e}"})
         except WebSocketDisconnect:
             state["connected"] = False
+            # Stop stream watcher on disconnect
+            global _active_watcher
+            if _active_watcher:
+                await _active_watcher.stop()
+                _active_watcher = None
             log.info("Client disconnected")
 
     # Get the right IP for phone access
