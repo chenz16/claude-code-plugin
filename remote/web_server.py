@@ -155,15 +155,26 @@ class RemoteStreamWatcher:
                     buffer = []
 
                     if frame != self._last_content and frame.strip():
-                        # Extract only Claude Code reply lines (start with ●)
-                        old_lines = set(self._last_content.splitlines())
+                        # Extract Claude Code reply lines (● lines)
+                        # Use ordered comparison, not set, to detect repeated replies
+                        old = self._last_content.splitlines()
+                        new = frame.splitlines()
+
+                        # Find new lines by comparing from the end
+                        # (new content appears at the bottom of tmux pane)
                         new_replies = []
-                        for l in frame.splitlines():
-                            if l not in old_lines:
+                        # Simple approach: find lines in new that aren't in old (preserving order and duplicates)
+                        # Convert old to a counter-like structure
+                        from collections import Counter
+                        old_counter = Counter(old)
+                        for l in new:
+                            if old_counter.get(l, 0) > 0:
+                                old_counter[l] -= 1
+                            else:
                                 stripped = l.strip()
-                                # Only keep actual reply content (● lines)
                                 if stripped.startswith('●'):
                                     new_replies.append(stripped[1:].strip())
+
                         if new_replies:
                             reply_text = "\n".join(new_replies)
                             if reply_text.strip():
