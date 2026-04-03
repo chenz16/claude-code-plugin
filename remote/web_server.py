@@ -155,31 +155,47 @@ class RemoteStreamWatcher:
                     buffer = []
 
                     if frame != self._last_content and frame.strip():
-                        # Extract Claude Code reply lines (● lines)
-                        # Use ordered comparison, not set, to detect repeated replies
+                        # Extract new Claude Code reply blocks
+                        from collections import Counter
                         old = self._last_content.splitlines()
                         new = frame.splitlines()
 
-                        # Find new lines by comparing from the end
-                        # (new content appears at the bottom of tmux pane)
-                        new_replies = []
-                        # Simple approach: find lines in new that aren't in old (preserving order and duplicates)
-                        # Convert old to a counter-like structure
-                        from collections import Counter
+                        # Find truly new lines (Counter handles duplicates)
                         old_counter = Counter(old)
+                        new_lines = []
                         for l in new:
                             if old_counter.get(l, 0) > 0:
                                 old_counter[l] -= 1
                             else:
-                                stripped = l.strip()
-                                if stripped.startswith('●'):
-                                    new_replies.append(stripped[1:].strip())
+                                new_lines.append(l)
 
-                        if new_replies:
-                            reply_text = "\n".join(new_replies)
-                            if reply_text.strip():
+                        # Extract reply blocks: ● line + continuation lines
+                        # Skip prompts (❯), separators (───), UI noise
+                        reply_parts = []
+                        in_reply = False
+                        for l in new_lines:
+                            stripped = l.strip()
+                            if not stripped:
+                                if in_reply:
+                                    reply_parts.append('')
+                                continue
+                            if stripped.startswith('●'):
+                                in_reply = True
+                                reply_parts.append(stripped[1:].strip())
+                            elif in_reply:
+                                # Continuation: indented lines, list items, etc.
+                                if stripped.startswith('❯') or stripped.startswith('⏵') or all(c in '─━═' for c in stripped):
+                                    in_reply = False
+                                elif 'bypass permissions' in stripped.lower():
+                                    in_reply = False
+                                else:
+                                    reply_parts.append(stripped)
+
+                        if reply_parts:
+                            reply_text = "\n".join(reply_parts).strip()
+                            if reply_text:
                                 try:
-                                    await self.on_output(reply_text[-1000:])
+                                    await self.on_output(reply_text[-2000:])
                                 except Exception:
                                     pass
                         self._last_content = frame
@@ -536,207 +552,227 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
 <meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="mobile-web-app-capable" content="yes">
-<meta name="theme-color" content="#1a1a2e">
+<meta name="theme-color" content="#075E54">
 <link rel="manifest" href="/manifest.json">
 <title>Claude Code</title>
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
-body { font-family: -apple-system, system-ui, sans-serif; background: #1a1a2e; color: #eee; height: 100vh; display: flex; flex-direction: column; }
-#header { background: #16213e; padding: 12px 16px; font-size: 16px; font-weight: 600; border-bottom: 1px solid #333; }
-#status { font-size: 11px; color: #4CAF50; margin-top: 2px; }
-#focused-bar { background: #0f3460; padding: 10px 16px; border-bottom: 1px solid #333; display: none; cursor: pointer; }
-#focused-bar .label { font-size: 14px; font-weight: 600; color: #4CAF50; }
-#focused-bar .hint { font-size: 11px; color: #888; }
-#session-panel { background: #16213e; border-bottom: 1px solid #333; padding: 8px; max-height: 50vh; overflow-y: auto; }
-.session-item { padding: 14px; margin: 6px 0; background: #2a2a4a; border-radius: 8px; cursor: pointer; border: 2px solid transparent; }
-.session-item:active { background: #3a3a5a; }
-.session-item.active { border-color: #4CAF50; }
-.session-name { font-size: 15px; font-weight: 600; }
-.session-host { font-size: 12px; color: #888; margin-top: 4px; }
-#messages { flex: 1; overflow-y: auto; padding: 12px; }
-.msg { margin-bottom: 10px; padding: 8px 12px; border-radius: 8px; max-width: 90%; word-wrap: break-word; white-space: pre-wrap; font-size: 14px; line-height: 1.4; }
-.msg.user { background: #0f3460; margin-left: auto; }
-.msg.bot { background: #2a2a4a; }
-.msg code, .msg pre { font-family: 'SF Mono', Monaco, monospace; font-size: 12px; }
-#input-area { background: #16213e; padding: 10px; border-top: 1px solid #333; display: flex; gap: 8px; align-items: center; }
-#text-input { flex: 1; padding: 10px; border-radius: 20px; border: 1px solid #444; background: #1a1a2e; color: #eee; font-size: 15px; outline: none; }
-#text-input:focus { border-color: #4CAF50; }
-button { border: none; cursor: pointer; -webkit-tap-highlight-color: transparent; border-radius: 0; width: auto; height: auto; }
-.round-btn { border-radius: 50% !important; width: 56px !important; height: 56px !important; display: flex; align-items: center; justify-content: center; }
-#send-btn { background: #4CAF50; color: white; font-size: 22px; min-width: 56px; }
-#mic-btn { background: #e53935; color: white; font-size: 26px; min-width: 56px; }
-#mic-btn.recording { background: #f44336; animation: pulse 1s infinite; }
+body { font-family: -apple-system, system-ui, sans-serif; background: #ededed; color: #111; height: 100vh; display: flex; flex-direction: column; }
+
+/* ===== Sessions page (friends list) ===== */
+#page-sessions { display: flex; flex-direction: column; height: 100vh; }
+.topbar { background: #075E54; color: white; padding: 14px 16px; font-size: 18px; font-weight: 600; display: flex; align-items: center; justify-content: space-between; }
+.topbar .status { font-size: 11px; font-weight: 400; opacity: 0.8; }
+#session-list { flex: 1; overflow-y: auto; background: white; }
+.s-item { display: flex; align-items: center; padding: 14px 16px; border-bottom: 1px solid #f0f0f0; cursor: pointer; }
+.s-item:active { background: #f5f5f5; }
+.s-avatar { width: 50px; height: 50px; border-radius: 50%; background: #25D366; display: flex; align-items: center; justify-content: center; font-size: 20px; color: white; font-weight: 700; flex-shrink: 0; margin-right: 14px; }
+.s-avatar.local { background: #128C7E; }
+.s-info { flex: 1; min-width: 0; }
+.s-name { font-size: 16px; font-weight: 600; color: #111; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.s-host { font-size: 13px; color: #667; margin-top: 2px; }
+
+/* ===== Chat page ===== */
+#page-chat { display: none; flex-direction: column; height: 100vh; }
+.chat-topbar { background: #075E54; color: white; padding: 10px 16px; display: flex; align-items: center; gap: 12px; }
+.back-btn { font-size: 22px; cursor: pointer; padding: 4px 8px; }
+.chat-name { font-size: 16px; font-weight: 600; flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+#messages { flex: 1; overflow-y: auto; padding: 8px 12px; background: #e5ddd5; }
+.msg { margin-bottom: 6px; padding: 7px 10px; border-radius: 8px; max-width: 82%; word-wrap: break-word; white-space: pre-wrap; font-size: 14px; line-height: 1.4; position: relative; clear: both; }
+.msg.user { background: #DCF8C6; color: #111; float: right; border-bottom-right-radius: 2px; }
+.msg.bot { background: white; color: #111; float: left; border-bottom-left-radius: 2px; }
+.msg.waiting { background: white; color: #999; float: left; font-style: italic; }
+.msg::after { content: ''; display: block; clear: both; }
+#input-area { background: #f0f0f0; padding: 6px 8px; display: flex; gap: 6px; align-items: center; }
+#text-input { flex: 1; padding: 10px 14px; border-radius: 24px; border: none; background: white; color: #111; font-size: 15px; outline: none; }
+.input-btn { border: none; cursor: pointer; border-radius: 50%; width: 46px; height: 46px; display: flex; align-items: center; justify-content: center; font-size: 20px; -webkit-tap-highlight-color: transparent; }
+#send-btn { background: #075E54; color: white; }
+#mic-btn { background: #075E54; color: white; }
+#mic-btn.recording { background: #e53935; animation: pulse 1s infinite; }
 @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+.clearfix::after { content: ''; display: block; clear: both; }
 </style>
 </head>
 <body>
-<div id="header">
-  Claude Code Remote
-  <div id="status">connecting...</div>
+
+<!-- Sessions page (friends list) -->
+<div id="page-sessions">
+  <div class="topbar">
+    <div>Claude Code<div class="status" id="status">connecting...</div></div>
+  </div>
+  <div id="session-list"></div>
 </div>
-<div id="focused-bar" onclick="showSessions()">
-  <span class="label" id="focused-name"></span>
-  <span class="hint"> (tap to switch)</span>
-</div>
-<div id="session-panel"></div>
-<div id="messages"></div>
-<div id="input-area">
-  <button id="mic-btn" class="round-btn" ontouchstart="event.preventDefault();startMic()" ontouchend="event.preventDefault();stopMic()" onmousedown="startMic()" onmouseup="stopMic()">🎤</button>
-  <input id="text-input" placeholder="Type or use voice..." onkeydown="if(event.key==='Enter')sendText()">
-  <button id="send-btn" class="round-btn" ontouchstart="event.preventDefault();sendText()" onclick="sendText()">→</button>
+
+<!-- Chat page -->
+<div id="page-chat">
+  <div class="chat-topbar">
+    <div class="back-btn" onclick="goBack()">&#8592;</div>
+    <div class="chat-name" id="chat-name"></div>
+  </div>
+  <div id="messages"></div>
+  <div id="input-area">
+    <div id="mic-btn" class="input-btn" ontouchstart="event.preventDefault();startMic()" ontouchend="event.preventDefault();stopMic()" onmousedown="startMic()" onmouseup="stopMic()">&#127908;</div>
+    <input id="text-input" placeholder="Type a message" onkeydown="if(event.key==='Enter')sendText()">
+    <div id="send-btn" class="input-btn" ontouchstart="event.preventDefault();sendText()" onclick="sendText()">&#10148;</div>
+  </div>
 </div>
 
 <script>
-let ws;
-let mediaRecorder;
-let audioChunks = [];
-let isRecording = false;
-let focusedIdx = null;
+let ws, mediaRecorder, audioChunks = [], isRecording = false;
+let focusedIdx = null, focusedName = '';
+// Per-session chat history: { idx: [{who, text}] }
+const chatHistory = {};
 
 function connect() {
   const proto = (location.protocol === 'https:') ? 'wss:' : 'ws:';
   ws = new WebSocket(proto + '//' + location.host + '/ws');
   ws.onopen = () => {
-    document.getElementById('status').textContent = 'connected';
-    showSessions();
+    document.getElementById('status').textContent = 'online';
+    loadSessions();
   };
   ws.onclose = () => {
-    document.getElementById('status').textContent = 'reconnecting...';
+    document.getElementById('status').textContent = 'offline';
     setTimeout(connect, 2000);
   };
   ws.onmessage = (e) => {
     const msg = JSON.parse(e.data);
+    if (!focusedIdx) return;
     if (msg.type === 'voice_text') {
-      // Replace [voice] placeholder with actual recognized text
-      const voiceMsg = document.getElementById('voice-placeholder');
-      if (voiceMsg) {
-        voiceMsg.textContent = msg.text;
-        voiceMsg.removeAttribute('id');
-      } else {
-        addMessage(msg.text, 'user');
-      }
+      const v = document.getElementById('voice-placeholder');
+      if (v) { v.textContent = msg.text; v.removeAttribute('id'); }
+      else { addMsg(msg.text, 'user'); }
+      saveChat(focusedIdx, 'user', msg.text);
     } else if (msg.type === 'waiting') {
       const div = document.createElement('div');
-      div.className = 'msg bot waiting';
+      div.className = 'msg waiting clearfix';
       div.textContent = msg.text;
       div.id = 'waiting-msg';
       document.getElementById('messages').appendChild(div);
-      div.scrollIntoView({ behavior: 'smooth' });
+      div.scrollIntoView({behavior:'smooth'});
     } else {
       const w = document.getElementById('waiting-msg');
       if (w) w.remove();
-      addMessage(msg.text, 'bot');
+      if (msg.text && !msg.text.startsWith('Focused on')) {
+        addMsg(msg.text, 'bot');
+        saveChat(focusedIdx, 'bot', msg.text);
+      }
     }
   };
 }
 
-function addMessage(text, who) {
+function saveChat(idx, who, text) {
+  if (!chatHistory[idx]) chatHistory[idx] = [];
+  chatHistory[idx].push({who, text});
+}
+
+function addMsg(text, who) {
   const div = document.createElement('div');
-  div.className = 'msg ' + who;
+  div.className = 'msg ' + who + ' clearfix';
   div.textContent = text;
   document.getElementById('messages').appendChild(div);
-  div.scrollIntoView({ behavior: 'smooth' });
+  div.scrollIntoView({behavior:'smooth'});
+}
+
+function renderChat(idx) {
+  const msgs = document.getElementById('messages');
+  msgs.innerHTML = '';
+  (chatHistory[idx] || []).forEach(m => addMsg(m.text, m.who));
+}
+
+// === Sessions page ===
+async function loadSessions() {
+  const list = document.getElementById('session-list');
+  list.innerHTML = '<div style="padding:20px;color:#999;text-align:center">Loading...</div>';
+  try {
+    const resp = await fetch('/api/sessions');
+    const sessions = await resp.json();
+    if (!sessions.length) {
+      list.innerHTML = '<div style="padding:20px;color:#999;text-align:center">No sessions</div>';
+      return;
+    }
+    list.innerHTML = sessions.map(s => {
+      const isLocal = s.host === '__local__';
+      const initial = isLocal ? 'L' : s.project.charAt(0).toUpperCase();
+      const hostLabel = isLocal ? 'Local paste' : (s.host || 'local tmux');
+      const unread = (chatHistory[s.idx] || []).filter(m => m.who === 'bot').length;
+      return '<div class="s-item" onclick="openChat(' + s.idx + ',\\x27' + s.project.replace(/'/g,'') + '\\x27)">' +
+        '<div class="s-avatar' + (isLocal ? ' local' : '') + '">' + initial + '</div>' +
+        '<div class="s-info"><div class="s-name">' + s.project + '</div>' +
+        '<div class="s-host">' + hostLabel + '</div></div></div>';
+    }).join('');
+  } catch(e) {
+    list.innerHTML = '<div style="padding:20px;color:red;text-align:center">Failed to load</div>';
+  }
+}
+
+function openChat(idx, name) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  focusedIdx = idx;
+  focusedName = name;
+  document.getElementById('chat-name').textContent = name;
+  document.getElementById('page-sessions').style.display = 'none';
+  document.getElementById('page-chat').style.display = 'flex';
+  renderChat(idx);
+  ws.send(JSON.stringify({type:'text', text:'/focus ' + idx}));
+  document.getElementById('text-input').focus();
+}
+
+function goBack() {
+  document.getElementById('page-chat').style.display = 'none';
+  document.getElementById('page-sessions').style.display = 'flex';
+  focusedIdx = null;
+  ws.send(JSON.stringify({type:'text', text:'/unfocus'}));
+  loadSessions();
 }
 
 function sendText() {
   const input = document.getElementById('text-input');
   const text = input.value.trim();
-  if (!text) return;
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    addMessage('[Not connected]', 'bot');
-    connect();
-    return;
-  }
-  addMessage(text, 'user');
-  ws.send(JSON.stringify({ type: 'text', text: text }));
+  if (!text || !focusedIdx) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) { connect(); return; }
+  addMsg(text, 'user');
+  saveChat(focusedIdx, 'user', text);
+  ws.send(JSON.stringify({type:'text', text:text}));
   input.value = '';
   input.focus();
 }
 
-// Sessions panel
-async function showSessions() {
-  const panel = document.getElementById('session-panel');
-  panel.style.display = 'block';
-  panel.innerHTML = '<div style="padding:12px;color:#888">Loading...</div>';
-  try {
-    const resp = await fetch('/api/sessions');
-    const sessions = await resp.json();
-    if (sessions.length === 0) {
-      panel.innerHTML = '<div style="padding:12px;color:#888">No sessions found</div>';
-      return;
-    }
-    panel.innerHTML = '<div style="padding:4px 8px;color:#888;font-size:12px">Select a session:</div>' +
-      sessions.map(s => {
-        const isActive = focusedIdx === s.idx;
-        const hostLabel = s.host ? s.host : 'local';
-        return '<div class="session-item' + (isActive ? ' active' : '') + '" onclick="focusSession(' + s.idx + ',\\x27' + s.project + '\\x27)">' +
-          '<div class="session-name">#' + s.idx + ' ' + s.project + '</div>' +
-          '<div class="session-host">' + hostLabel + '</div>' +
-          '</div>';
-      }).join('');
-  } catch (e) {
-    panel.innerHTML = '<div style="padding:12px;color:#f44336">Failed to load sessions</div>';
-  }
-}
-
-function focusSession(idx, name) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  focusedIdx = idx;
-  ws.send(JSON.stringify({ type: 'text', text: '/focus ' + idx }));
-  // Hide panel, show focused bar
-  document.getElementById('session-panel').style.display = 'none';
-  document.getElementById('focused-bar').style.display = 'block';
-  document.getElementById('focused-name').textContent = '#' + idx + ' ' + name;
-}
-
-// Mic
+// === Voice ===
 let micStream = null;
-
 async function startMic() {
-  if (isRecording) return;
-  const btn = document.getElementById('mic-btn');
+  if (isRecording || !focusedIdx) return;
   try {
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: { sampleRate: 16000, channelCount: 1 } });
-    mediaRecorder = new MediaRecorder(micStream, { mimeType: 'audio/webm' });
+    micStream = await navigator.mediaDevices.getUserMedia({audio:{sampleRate:16000,channelCount:1}});
+    mediaRecorder = new MediaRecorder(micStream, {mimeType:'audio/webm'});
     audioChunks = [];
-    mediaRecorder.ondataavailable = (e) => audioChunks.push(e.data);
+    mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
     mediaRecorder.onstop = async () => {
-      micStream.getTracks().forEach(t => t.stop());
-      micStream = null;
-      const blob = new Blob(audioChunks, { type: 'audio/webm' });
+      micStream.getTracks().forEach(t=>t.stop()); micStream=null;
+      const blob = new Blob(audioChunks, {type:'audio/webm'});
       const reader = new FileReader();
       reader.onload = () => {
-        const base64 = reader.result.split(',')[1];
+        const b64 = reader.result.split(',')[1];
         const div = document.createElement('div');
-        div.className = 'msg user';
-        div.textContent = '识别中...';
+        div.className = 'msg user clearfix'; div.textContent = '识别中...';
         div.id = 'voice-placeholder';
         document.getElementById('messages').appendChild(div);
-        div.scrollIntoView({ behavior: 'smooth' });
-        ws.send(JSON.stringify({ type: 'audio', data: base64 }));
+        div.scrollIntoView({behavior:'smooth'});
+        ws.send(JSON.stringify({type:'audio',data:b64}));
       };
       reader.readAsDataURL(blob);
     };
-    mediaRecorder.start();
-    isRecording = true;
-    btn.classList.add('recording');
-    btn.textContent = '⏹';
-  } catch (err) {
-    addMessage('Mic error: ' + err.message, 'bot');
-  }
+    mediaRecorder.start(); isRecording = true;
+    document.getElementById('mic-btn').classList.add('recording');
+  } catch(err) { addMsg('Mic: '+err.message,'bot'); }
 }
 
 function stopMic() {
   if (!isRecording) return;
-  const btn = document.getElementById('mic-btn');
   isRecording = false;
-  btn.classList.remove('recording');
-  btn.textContent = '🎤';
-  if (mediaRecorder && mediaRecorder.state !== 'inactive') {
-    mediaRecorder.stop();
-  }
+  document.getElementById('mic-btn').classList.remove('recording');
+  if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
 }
 
 connect();
