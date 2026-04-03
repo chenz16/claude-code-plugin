@@ -97,26 +97,25 @@ def save_screenshot(img):
 
 
 def handle_local(local_path):
-    """Local mode: auto-type file path into focused window (like voice does)."""
+    """Local mode: auto-type file path into focused window."""
     try:
-        import pyperclip
-        from pynput.keyboard import Key, Controller
-        kb = Controller()
-
-        pyperclip.copy(local_path)
-        time.sleep(0.1)
-
         if IS_MAC:
+            import pyperclip
+            from pynput.keyboard import Key, Controller
+            kb = Controller()
+            pyperclip.copy(local_path)
+            time.sleep(0.1)
             kb.press(Key.cmd)
             kb.press("v")
             kb.release("v")
             kb.release(Key.cmd)
         else:
-            kb.press(Key.ctrl)
-            kb.press("v")
-            kb.release("v")
-            kb.release(Key.ctrl)
-
+            # Linux: use xclip + xdotool (Ctrl+Shift+V for terminal paste)
+            subprocess.run(["xclip", "-selection", "clipboard"],
+                           input=local_path.encode(), timeout=5)
+            time.sleep(0.1)
+            subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+shift+v"],
+                           timeout=5)
         print(f"  Path auto-pasted to focused window!", flush=True)
     except Exception as e:
         print(f"  Path: {local_path}", flush=True)
@@ -212,77 +211,137 @@ def handle_remote(local_path, host):
     print(f"  Image path sent! Press Enter in Claude Code to include it.", flush=True)
 
 
-# ── SSH host detection (for multi-host / auto mode) ──
+# ── Active terminal detection (same approach as voice_input.py) ──
 
-def detect_all_ssh_hosts():
-    """Scan all active SSH connections."""
-    hosts = set()
+# Terminal PID and known remote hosts
+_terminal_pid = None
+_remote_hosts = {}  # ip -> user@host
+
+
+def find_terminal_pid():
+    """Find the PID of the terminal emulator by walking up from current process."""
     try:
-        if IS_WIN:
-            # Windows: check for ssh.exe processes
+        pid = os.getppid()
+        for _ in range(5):
             ret = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq ssh.exe", "/FO", "CSV", "/NH"],
-                capture_output=True, text=True, timeout=5,
+                ["ps", "-o", "ppid=,comm=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=3,
             )
-            # Also check via wsl
-            ret2 = subprocess.run(
-                ["wsl", "pgrep", "-a", "ssh"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in ret2.stdout.strip().splitlines():
-                parts = line.split()
-                # Find user@host pattern in ssh command args
-                for p in parts:
-                    if "@" in p and not p.startswith("-"):
-                        hosts.add(p)
-        else:
-            ret = subprocess.run(
-                ["pgrep", "-a", "ssh"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in ret.stdout.strip().splitlines():
-                parts = line.split()
-                for p in parts:
-                    if "@" in p and not p.startswith("-"):
-                        hosts.add(p)
+            parts = ret.stdout.strip().split(None, 1)
+            if len(parts) < 2:
+                break
+            ppid, comm = parts[0], parts[1]
+            if any(t in comm.lower() for t in ["terminator", "terminal", "x-terminal",
+                                                 "gnome-term", "konsole", "xterm",
+                                                 "alacritty", "kitty"]):
+                return int(pid)
+            pid = ppid
+        # Fallback: active window PID
+        ret = subprocess.run(
+            ["xprop", "-root", "_NET_ACTIVE_WINDOW"],
+            capture_output=True, text=True, timeout=2,
+        )
+        wid = ret.stdout.strip().split()[-1]
+        ret = subprocess.run(
+            ["xprop", "-id", wid, "_NET_WM_PID"],
+            capture_output=True, text=True, timeout=2,
+        )
+        return int(ret.stdout.strip().split()[-1])
     except Exception:
-        pass
-    return list(hosts)
-
-
-def resolve_target_host():
-    """Determine which host to send the screenshot to."""
-    if args.host:
-        return args.host
-
-    # Auto/multi-host: scan SSH connections
-    all_hosts = detect_all_ssh_hosts()
-
-    if args.hosts:
-        allowed = set(args.hosts)
-        for h in all_hosts:
-            if h in allowed:
-                return h
-            bare = h.split("@")[-1] if "@" in h else h
-            for a in allowed:
-                if bare == (a.split("@")[-1] if "@" in a else a):
-                    return a
-        print(f"  No matching SSH host found. Active: {all_hosts}, Allowed: {args.hosts}", flush=True)
         return None
 
-    if len(all_hosts) == 1:
-        host = all_hosts[0]
-        print(f"  Auto-detected SSH host: {host}", flush=True)
-        return host
-    elif all_hosts:
-        print(f"  Multiple SSH connections: {all_hosts}", flush=True)
-        print(f"  Use --host or --hosts to specify target.", flush=True)
-    else:
-        print("  No active SSH connections found.", flush=True)
-    return None
+
+def scan_ssh_connections():
+    """Scan running SSH processes to find remote hosts. Returns {ip: user@host}."""
+    discovered = {}
+    try:
+        ret = subprocess.run(
+            ["pgrep", "-a", "ssh"],
+            capture_output=True, text=True, timeout=3,
+        )
+        for line in ret.stdout.strip().splitlines():
+            parts = line.split()
+            for part in parts[1:]:
+                if "@" in part and not part.startswith("-") and "/" not in part and not part.startswith("["):
+                    ip = part.split("@")[-1]
+                    if ip and not ip.startswith("-"):
+                        discovered[ip] = part
+    except Exception:
+        pass
+    return discovered
 
 
-# ── Main loop ──
+def detect_active_target():
+    """Detect whether the user's active terminal tab is SSH'd to a remote host.
+
+    Checks pts mtime to find the most recently active tab, then checks if
+    that tab has an SSH child process to a known remote host.
+
+    Returns: ("remote", ssh_host_str) or ("local", None)
+    Pure local operations, <10ms.
+    """
+    if not _terminal_pid:
+        return "local", None
+
+    try:
+        ret = subprocess.run(
+            ["ps", "--ppid", str(_terminal_pid), "-o", "pid,tty", "--no-headers"],
+            capture_output=True, text=True, timeout=3,
+        )
+
+        pts_pids = {}
+        for line in ret.stdout.strip().splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[1].startswith("pts/"):
+                pts_num = parts[1].split("/")[1]
+                pts_pids[pts_num] = parts[0]
+
+        if not pts_pids:
+            return "local", None
+
+        # Find most recently active pts
+        best_time = 0
+        best_pts = None
+        for pts_num in pts_pids:
+            try:
+                mtime = os.stat(f"/dev/pts/{pts_num}").st_mtime
+                if mtime > best_time:
+                    best_time = mtime
+                    best_pts = pts_num
+            except OSError:
+                continue
+
+        if not best_pts:
+            return "local", None
+
+        # Check if this pts has SSH to any known remote host
+        bash_pid = pts_pids[best_pts]
+        ret = subprocess.run(
+            ["pgrep", "-a", "-P", bash_pid],
+            capture_output=True, text=True, timeout=3,
+        )
+        for line in ret.stdout.strip().splitlines():
+            if "ssh" not in line:
+                continue
+            for ip, host_str in _remote_hosts.items():
+                if ip in line:
+                    return "remote", host_str
+            # Auto-discover new host
+            parts = line.split()
+            for part in parts[1:]:
+                if "@" in part and not part.startswith("-") and "/" not in part:
+                    ip = part.split("@")[-1]
+                    if ip and not ip.startswith("-"):
+                        _remote_hosts[ip] = part
+                        print(f"  [auto] Discovered new remote host: {part}", flush=True)
+                        return "remote", part
+
+        return "local", None
+    except Exception:
+        return "local", None
+
+
+# ── Legacy detection for Windows ──
 
 def check_wsl_tmux():
     """Check if WSL has an active tmux session. Returns True if found."""
@@ -298,51 +357,46 @@ def check_wsl_tmux():
         return False
 
 
+# ── Main loop ──
+
 def on_new_screenshot(img):
     """Handle a newly detected screenshot.
 
-    Auto-detection priority:
-      1. If --host/--hosts/--auto specified → remote mode
-      2. If --wsl specified → WSL mode
-      3. Auto: check WSL tmux → check SSH connections → local paste
+    On Linux: uses pts-based detection (same as voice_input.py)
+      - Active tab has SSH to remote -> SCP + send to remote tmux
+      - Otherwise -> paste path into local window
+
+    On Windows/macOS: legacy detection (WSL tmux -> SSH scan -> local)
     """
     print(f"\n  New screenshot detected!", flush=True)
     local_path = save_screenshot(img)
 
-    sent = False
-
-    if args.host or args.hosts or args.auto:
-        # Explicit remote mode
-        host = resolve_target_host()
-        if host:
-            handle_remote(local_path, host)
-            sent = True
+    if args.host:
+        # Explicit host mode
+        handle_remote(local_path, args.host)
     elif args.wsl:
-        # Explicit WSL mode
         handle_wsl(local_path)
-        sent = True
-    else:
-        # Auto-detect: WSL tmux → SSH → local
-        if IS_WIN and check_wsl_tmux():
-            print(f"  Auto-detected: Claude Code in WSL tmux", flush=True)
-            handle_wsl(local_path)
-            sent = True
+    elif IS_LINUX and _terminal_pid:
+        # Linux: pts-based auto-detection
+        mode, host = detect_active_target()
+        if mode == "remote" and host:
+            print(f"  [auto] Active tab -> {host}", flush=True)
+            handle_remote(local_path, host)
         else:
-            # Check for SSH connections
-            ssh_hosts = detect_all_ssh_hosts()
+            print(f"  [auto] Active tab -> LOCAL", flush=True)
+            handle_local(local_path)
+    else:
+        # Windows/macOS fallback
+        if IS_WIN and check_wsl_tmux():
+            handle_wsl(local_path)
+        else:
+            ssh_hosts = scan_ssh_connections()
             if len(ssh_hosts) == 1:
-                print(f"  Auto-detected: SSH to {ssh_hosts[0]}", flush=True)
-                handle_remote(local_path, ssh_hosts[0])
-                sent = True
-            elif not ssh_hosts:
-                # Local mode: auto-type into focused window
-                handle_local(local_path)
-                sent = True
+                host = list(ssh_hosts.values())[0]
+                print(f"  Auto-detected: SSH to {host}", flush=True)
+                handle_remote(local_path, host)
             else:
-                print(f"  Multiple SSH connections: {ssh_hosts}", flush=True)
-                print(f"  Use --host to specify, falling back to local paste.", flush=True)
                 handle_local(local_path)
-                sent = True
 
     if args.cleanup and os.path.exists(local_path):
         os.remove(local_path)
@@ -370,30 +424,22 @@ def clipboard_monitor_loop():
 
 
 def main():
-    global args
+    global args, _terminal_pid, _remote_hosts
 
     parser = argparse.ArgumentParser(
         description="Screenshot input for Claude Code. "
         "Monitors clipboard for new screenshots and auto-sends to Claude Code. "
-        "No flags needed — auto-detects WSL tmux, SSH connections, or pastes locally."
+        "No flags needed — auto-detects active terminal tab (local vs SSH remote)."
     )
-    target = parser.add_mutually_exclusive_group()
-    target.add_argument("--wsl", action="store_true",
+    parser.add_argument("--wsl", action="store_true",
                         help="Force send to WSL tmux (Windows only)")
-    target.add_argument("--host",
+    parser.add_argument("--host",
                         help="Force send to this SSH host (e.g. user@remote-ip)")
-    target.add_argument("--hosts",
-                        help="Comma-separated SSH hosts for multi-host mode")
-    target.add_argument("--auto", action="store_true",
-                        help="Force auto-detect from SSH connections")
     parser.add_argument("--remote-dir", default=SCREENSHOT_REMOTE_DIR,
                         help=f"Remote screenshot directory (default: {SCREENSHOT_REMOTE_DIR})")
     parser.add_argument("--no-cleanup", dest="cleanup", action="store_false", default=True,
                         help="Keep local screenshot copies after transfer")
     args = parser.parse_args()
-
-    if args.hosts:
-        args.hosts = [h.strip() for h in args.hosts.split(",") if h.strip()]
 
     # Validate mode
     if args.wsl and not IS_WIN:
@@ -408,7 +454,7 @@ def main():
         print("  pip install Pillow")
         exit(1)
 
-    # Test SSH if remote mode
+    # Test SSH if explicit host
     if args.host:
         print(f"Testing SSH to {args.host}...", flush=True)
         if not test_ssh(args.host):
@@ -416,44 +462,43 @@ def main():
             exit(1)
         print("SSH OK.", flush=True)
         ensure_remote_dir(args.host, args.remote_dir)
-        sessions = list_remote_sessions(args.host)
-        if sessions:
-            print(f"  Available sessions: {', '.join(sessions)}", flush=True)
+        ip = args.host.split("@")[-1]
+        _remote_hosts[ip] = args.host
 
-    if args.hosts:
-        print(f"Testing SSH to {len(args.hosts)} hosts...", flush=True)
-        for host in args.hosts:
-            ok = test_ssh(host)
-            print(f"  {host}: {'OK' if ok else 'FAILED'}", flush=True)
+    # Linux: set up pts-based auto-detection
+    if IS_LINUX and not args.host and not args.wsl:
+        _terminal_pid = find_terminal_pid()
+        if _terminal_pid:
+            print(f"  [auto] Terminal PID: {_terminal_pid}", flush=True)
 
-    # Test WSL access
+        # Auto-discover active SSH connections
+        _remote_hosts = scan_ssh_connections()
+        if _remote_hosts:
+            print(f"  [auto] SSH hosts: {', '.join(_remote_hosts.values())}", flush=True)
+            # Test and prepare remote dirs
+            for ip, host_str in list(_remote_hosts.items()):
+                if test_ssh(host_str):
+                    ensure_remote_dir(host_str, args.remote_dir)
+                else:
+                    del _remote_hosts[ip]
+
+    # WSL check
     if args.wsl:
         ret = subprocess.run(["wsl", "echo", "ok"], capture_output=True, text=True, timeout=10)
         if ret.returncode != 0:
             print("ERROR: Cannot access WSL.")
             exit(1)
         print("WSL OK.", flush=True)
-        # Check tmux in WSL
-        ret = subprocess.run(
-            ["wsl", "tmux", "list-sessions", "-F", "#{session_name}"],
-            capture_output=True, text=True, timeout=10,
-        )
-        if ret.returncode == 0 and ret.stdout.strip():
-            print(f"  WSL tmux sessions: {', '.join(ret.stdout.strip().splitlines())}", flush=True)
-        else:
-            print("  Warning: no tmux sessions found in WSL.", flush=True)
 
-    # Determine mode description
+    # Mode description
     if args.wsl:
-        mode_str = "WSL tmux (forced)"
+        mode_str = "WSL tmux"
     elif args.host:
-        mode_str = f"Remote: {args.host} (forced)"
-    elif args.hosts:
-        mode_str = f"Remote multi-host: {', '.join(args.hosts)}"
-    elif args.auto:
-        mode_str = "Remote auto-detect (forced)"
+        mode_str = f"Remote: {args.host}"
+    elif IS_LINUX and _terminal_pid:
+        mode_str = "AUTO (active tab: SSH remote -> remote tmux, local -> paste)"
     else:
-        mode_str = "Auto-detect (WSL tmux -> SSH -> local paste)"
+        mode_str = "Auto-detect"
 
     plat = "Windows" if IS_WIN else ("macOS" if IS_MAC else "Linux")
     print("")
@@ -461,14 +506,7 @@ def main():
     print(f"  Platform: {plat}")
     print(f"  Mode: {mode_str}")
     print("")
-    print("  Take a screenshot with your favorite tool:")
-    if IS_WIN:
-        print("    Win+Shift+S  (Snipping Tool)")
-    elif IS_MAC:
-        print("    Cmd+Shift+4  (region)  /  Cmd+Shift+3  (full screen)")
-    else:
-        print("    Flameshot, Shutter, PrintScreen, or any tool")
-    print("")
+    print("  Take a screenshot (Shift+Ctrl+PrintScreen or any tool)")
     print("  Screenshots are detected from clipboard automatically.")
     print("  Press Ctrl+C to stop.")
     print("", flush=True)
