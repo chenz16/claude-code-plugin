@@ -39,6 +39,9 @@ FOCUS_TIMEOUT = 1800  # auto-unfocus after 30 minutes of inactivity
 # Remote hosts discovered via SSH
 _remote_hosts = {}  # ip -> user@host
 
+# Custom display names for sessions (idx -> name)
+_custom_names = {}  # idx -> custom name string
+
 
 def _scan_ssh_hosts():
     """Discover active SSH connections."""
@@ -575,6 +578,8 @@ body { font-family: -apple-system, system-ui, sans-serif; background: #ededed; c
 .s-info { flex: 1; min-width: 0; }
 .s-name { font-size: 16px; font-weight: 600; color: #111; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .s-host { font-size: 13px; color: #667; margin-top: 2px; }
+.s-edit { flex-shrink: 0; width: 32px; height: 32px; display: flex; align-items: center; justify-content: center; font-size: 16px; color: #999; cursor: pointer; border-radius: 50%; margin-left: 8px; }
+.s-edit:active { background: #eee; }
 
 /* ===== Chat page ===== */
 #page-chat { display: none; flex-direction: column; height: 100vh; }
@@ -626,6 +631,29 @@ let ws, mediaRecorder, audioChunks = [], isRecording = false;
 let focusedIdx = null, focusedName = '';
 // Per-session chat history: { idx: [{who, text}] }
 const chatHistory = {};
+// Custom session names from localStorage
+let customNames = JSON.parse(localStorage.getItem('customNames') || '{}');
+
+function getDisplayName(s) {
+  if (customNames[s.idx]) return customNames[s.idx];
+  if (s.custom_name) return s.custom_name;
+  return s.project;
+}
+
+function renameSession(idx, currentName, ev) {
+  ev.stopPropagation();
+  const newName = prompt('Rename session:', currentName);
+  if (newName === null) return;
+  const trimmed = newName.trim();
+  if (trimmed) {
+    customNames[idx] = trimmed;
+  } else {
+    delete customNames[idx];
+  }
+  localStorage.setItem('customNames', JSON.stringify(customNames));
+  fetch('/api/rename', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({idx:idx, name:trimmed})});
+  loadSessions();
+}
 
 let reconnectDelay = 1000;
 const MAX_RECONNECT_DELAY = 15000;
@@ -734,13 +762,14 @@ async function loadSessions() {
     }
     list.innerHTML = sessions.map(s => {
       const isLocal = s.host === '__local__';
-      const initial = isLocal ? 'L' : s.project.charAt(0).toUpperCase();
+      const dname = getDisplayName(s);
+      const initial = isLocal ? 'L' : dname.charAt(0).toUpperCase();
       const hostLabel = isLocal ? 'Local paste' : (s.host || 'local tmux');
-      const unread = (chatHistory[s.idx] || []).filter(m => m.who === 'bot').length;
-      return '<div class="s-item" onclick="openChat(' + s.idx + ',\\x27' + s.project.replace(/'/g,'') + '\\x27)">' +
+      return '<div class="s-item" onclick="openChat(' + s.idx + ',\\x27' + dname.replace(/'/g,'') + '\\x27)">' +
         '<div class="s-avatar' + (isLocal ? ' local' : '') + '">' + initial + '</div>' +
-        '<div class="s-info"><div class="s-name">' + s.project + '</div>' +
-        '<div class="s-host">' + hostLabel + '</div></div></div>';
+        '<div class="s-info"><div class="s-name">' + dname + '</div>' +
+        '<div class="s-host">' + hostLabel + '</div></div>' +
+        '<div class="s-edit" onclick="renameSession(' + s.idx + ',\\x27' + dname.replace(/'/g,'') + '\\x27,event)">&#9998;</div></div>';
     }).join('');
   } catch(e) {
     list.innerHTML = '<div style="padding:20px;color:red;text-align:center">Failed to load</div>';
@@ -750,8 +779,8 @@ async function loadSessions() {
 function openChat(idx, name) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
   focusedIdx = idx;
-  focusedName = name;
-  document.getElementById('chat-name').textContent = name;
+  focusedName = customNames[idx] || name;
+  document.getElementById('chat-name').textContent = focusedName;
   document.getElementById('page-sessions').style.display = 'none';
   document.getElementById('page-chat').style.display = 'flex';
   renderChat(idx);
@@ -847,7 +876,7 @@ def main():
     args = parser.parse_args()
 
     try:
-        from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+        from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
         from fastapi.responses import HTMLResponse
         import uvicorn
     except ImportError:
@@ -869,7 +898,22 @@ def main():
             "idx": inst["idx"],
             "project": inst["project"],
             "host": inst.get("host"),
+            "custom_name": _custom_names.get(inst["idx"]),
         } for inst in instances])
+
+    @app.post("/api/rename")
+    async def api_rename(request: Request):
+        from fastapi.responses import JSONResponse
+        body = await request.json()
+        idx = body.get("idx")
+        name = body.get("name", "").strip()
+        if idx is None:
+            return JSONResponse({"error": "idx required"}, status_code=400)
+        if name:
+            _custom_names[int(idx)] = name
+        else:
+            _custom_names.pop(int(idx), None)
+        return JSONResponse({"ok": True})
 
     @app.get("/manifest.json")
     async def manifest():

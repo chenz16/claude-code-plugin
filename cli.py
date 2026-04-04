@@ -83,12 +83,81 @@ def _start_all():
     # Start web server as a separate process (uvicorn needs its own event loop)
     import subprocess as _sp
     import atexit
+    import os
+    import re
+    import time as _time
     web_proc = _sp.Popen(
         [sys.executable, "-m", "remote.web_server", "--no-ssl"],
         stdout=None, stderr=None,
     )
     print(f"  [web] Started (PID {web_proc.pid})", flush=True)
     atexit.register(lambda: web_proc.terminate())
+
+    # Start cloudflared tunnel for public URL
+    cf_bin = "/tmp/cloudflared"
+    if not os.path.exists(cf_bin):
+        print("  [tunnel] Downloading cloudflared...", flush=True)
+        dl_ret = _sp.run(
+            ["curl", "-sL",
+             "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64",
+             "-o", cf_bin],
+            timeout=60,
+        )
+        os.chmod(cf_bin, 0o755)
+
+    cf_proc = _sp.Popen(
+        [cf_bin, "tunnel", "--url", "http://localhost:8080"],
+        stdout=_sp.DEVNULL, stderr=_sp.PIPE,
+    )
+    atexit.register(lambda: cf_proc.terminate())
+
+    # Wait for tunnel URL from cloudflared stderr
+    tunnel_url = None
+    deadline = _time.time() + 15
+    while _time.time() < deadline:
+        line = b""
+        # Read one byte at a time with a short timeout to avoid blocking
+        while _time.time() < deadline:
+            cf_proc.stderr.flush() if hasattr(cf_proc.stderr, 'flush') else None
+            import select
+            ready, _, _ = select.select([cf_proc.stderr], [], [], 0.5)
+            if not ready:
+                continue
+            ch = cf_proc.stderr.read(1)
+            if not ch:
+                break
+            line += ch
+            if ch == b"\n":
+                break
+        decoded = line.decode("utf-8", errors="replace")
+        m = re.search(r"(https://[a-zA-Z0-9-]+\.trycloudflare\.com)", decoded)
+        if m:
+            tunnel_url = m.group(1)
+            break
+
+    if tunnel_url:
+        print(f"\n  [tunnel] Public URL: {tunnel_url}", flush=True)
+        try:
+            import qrcode
+            qr = qrcode.QRCode(border=1)
+            qr.add_data(tunnel_url)
+            qr.make()
+            qr.print_ascii(invert=True)
+        except ImportError:
+            pass
+        print("", flush=True)
+    else:
+        print("  [tunnel] Warning: could not get tunnel URL (timeout)", flush=True)
+
+    # Read remaining cloudflared stderr in background so pipe doesn't block
+    def _drain_cf_stderr():
+        try:
+            for _ in cf_proc.stderr:
+                pass
+        except Exception:
+            pass
+    _cf_drain = threading.Thread(target=_drain_cf_stderr, daemon=True)
+    _cf_drain.start()
 
     # Start screenshot monitor in background thread
     def run_screenshot():
