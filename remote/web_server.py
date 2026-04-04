@@ -106,7 +106,7 @@ class RemoteStreamWatcher:
         self._task = None
         self._running = False
         self._last_content = ""
-        self._last_block = ""  # content of last ● block (for detecting new replies)
+        self._block_count = 0  # number of ● blocks (for detecting new replies)
         self._waiting_for_reply = False  # True after we send a message
 
     def update_send_fn(self, new_fn):
@@ -157,7 +157,7 @@ class RemoteStreamWatcher:
         baseline = _remote_capture_pane(self.host, self.session, 40)
         self._last_content = baseline
         blocks = self._extract_blocks(baseline)
-        self._last_block = blocks[-1] if blocks else ""
+        self._block_count = len(blocks)
         self._task = asyncio.create_task(self._run())
 
     async def stop(self):
@@ -209,33 +209,22 @@ class RemoteStreamWatcher:
                     buffer = []
                     if frame != self._last_content and frame.strip():
                         blocks = self._extract_blocks(frame)
-                        cur_last = blocks[-1] if blocks else ""
+                        new_count = len(blocks)
 
-                        if self._waiting_for_reply and cur_last and cur_last != self._last_block:
-                            # Last block changed — new reply appeared.
-                            # Find all blocks after the previous last block.
-                            # The old last block may still be in the list.
-                            new_blocks = []
-                            found_old = False
-                            for b in blocks:
-                                if not found_old:
-                                    if b == self._last_block:
-                                        found_old = True
-                                    continue
-                                new_blocks.append(b)
+                        if self._waiting_for_reply and new_count > self._block_count:
+                            # Block count increased — new reply(s) appeared
+                            new_blocks = blocks[self._block_count:]
+                            reply_text = "\n\n".join(new_blocks).strip()
+                            log.info("Reply detected (%d new blocks): %s",
+                                     len(new_blocks), reply_text[:100])
+                            if reply_text:
+                                self._waiting_for_reply = False
+                                try:
+                                    await self.on_output(reply_text[-2000:])
+                                except Exception as e:
+                                    log.error("Failed to send reply: %s", e)
 
-                            if new_blocks:
-                                reply_text = "\n\n".join(new_blocks).strip()
-                                log.info("Reply detected (%d new blocks): %s",
-                                         len(new_blocks), reply_text[:100])
-                                if reply_text:
-                                    self._waiting_for_reply = False
-                                    try:
-                                        await self.on_output(reply_text[-2000:])
-                                    except Exception as e:
-                                        log.error("Failed to send reply: %s", e)
-
-                        self._last_block = cur_last
+                        self._block_count = new_count
                         self._last_content = frame
                 else:
                     buffer.append(line.rstrip("\n"))
