@@ -90,6 +90,11 @@ class RemoteStreamWatcher:
     Instead of polling with a new SSH call each time, keeps one SSH
     connection open running a capture loop on the remote side.
     Output changes are detected and pushed via callback.
+
+    Reply detection: tracks the last ● block content in each frame.
+    When a new block appears after the previously known last block,
+    it is extracted and sent as a reply. Persistent UI blocks
+    (e.g. "How is Claude doing") are filtered out.
     """
 
     def __init__(self, host, session, on_output, interval=0.3):
@@ -101,18 +106,58 @@ class RemoteStreamWatcher:
         self._task = None
         self._running = False
         self._last_content = ""
-        self._pending_msg = None  # message we're waiting for a reply to
-        self._replied = True  # True = not waiting for reply
+        self._last_block = ""  # content of last ● block (for detecting new replies)
+        self._waiting_for_reply = False  # True after we send a message
 
-    def expect_reply(self, msg_text):
+    def update_send_fn(self, new_fn):
+        """Update the output callback (e.g. after WebSocket reconnect)."""
+        self.on_output = new_fn
+
+    def expect_reply(self):
         """Mark that we sent a message and are waiting for a reply."""
-        self._pending_msg = msg_text
-        self._replied = False
+        self._waiting_for_reply = True
+
+    # Blocks that are persistent Claude Code UI, not actual replies
+    _UI_BLOCK_PREFIXES = ("How is Claude doing",)
+
+    @staticmethod
+    def _extract_blocks(frame):
+        """Extract all ● blocks from a frame.
+
+        Returns a list of block texts. Each block starts with ● and
+        continues until the next ● or a prompt/separator line.
+        Filters out persistent UI blocks (e.g. session feedback prompt).
+        """
+        blocks = []
+        current_block = []
+        for line in frame.splitlines():
+            stripped = line.strip()
+            if stripped.startswith('●'):
+                if current_block:
+                    blocks.append("\n".join(current_block).strip())
+                current_block = [stripped[1:].strip()]
+            elif current_block:
+                # End block on prompt or separator lines
+                if (stripped.startswith('❯') or stripped.startswith('⏵')
+                        or 'bypass permissions' in stripped.lower()
+                        or (stripped and all(c in '─━═' for c in stripped))):
+                    blocks.append("\n".join(current_block).strip())
+                    current_block = []
+                elif stripped:
+                    current_block.append(stripped)
+        if current_block:
+            blocks.append("\n".join(current_block).strip())
+        # Filter out empty blocks and persistent UI blocks
+        return [b for b in blocks if b and not any(
+            b.startswith(p) for p in RemoteStreamWatcher._UI_BLOCK_PREFIXES)]
 
     async def start(self):
         """Start the persistent SSH stream."""
         self._running = True
-        self._last_content = _remote_capture_pane(self.host, self.session, 20)
+        baseline = _remote_capture_pane(self.host, self.session, 40)
+        self._last_content = baseline
+        blocks = self._extract_blocks(baseline)
+        self._last_block = blocks[-1] if blocks else ""
         self._task = asyncio.create_task(self._run())
 
     async def stop(self):
@@ -135,7 +180,7 @@ class RemoteStreamWatcher:
         # Remote command: loop capturing tmux pane, separated by markers
         remote_cmd = (
             f"while true; do "
-            f"tmux capture-pane -t {self.session} -p -S -20 2>/dev/null; "
+            f"tmux capture-pane -t {self.session} -p -S -40 2>/dev/null; "
             f"echo '@@__FRAME__@@'; "
             f"sleep {self.interval}; "
             f"done"
@@ -162,44 +207,35 @@ class RemoteStreamWatcher:
                     # Got a complete frame
                     frame = "\n".join(buffer)
                     buffer = []
-
                     if frame != self._last_content and frame.strip():
-                        # If we're waiting for a reply, find it
-                        if not self._replied and self._pending_msg:
-                            lines = frame.splitlines()
-                            # Find our sent message, then collect ALL ● blocks after it
-                            msg_found = False
-                            all_reply_parts = []
-                            current_block = []
-                            for l in lines:
-                                stripped = l.strip()
-                                if not msg_found:
-                                    if self._pending_msg[:20] in stripped:
-                                        msg_found = True
-                                    continue
-                                # After our message, collect all ● blocks
-                                if stripped.startswith('●'):
-                                    if current_block:
-                                        all_reply_parts.append("\n".join(current_block).strip())
-                                    current_block = [stripped[1:].strip()]
-                                elif current_block:
-                                    if stripped.startswith('❯') or stripped.startswith('⏵') or 'bypass permissions' in stripped.lower() or (stripped and all(c in '─━═' for c in stripped)):
-                                        all_reply_parts.append("\n".join(current_block).strip())
-                                        current_block = []
-                                    elif stripped:
-                                        current_block.append(stripped)
-                            if current_block:
-                                all_reply_parts.append("\n".join(current_block).strip())
+                        blocks = self._extract_blocks(frame)
+                        cur_last = blocks[-1] if blocks else ""
 
-                            if all_reply_parts:
-                                reply_text = "\n\n".join(all_reply_parts).strip()
+                        if self._waiting_for_reply and cur_last and cur_last != self._last_block:
+                            # Last block changed — new reply appeared.
+                            # Find all blocks after the previous last block.
+                            # The old last block may still be in the list.
+                            new_blocks = []
+                            found_old = False
+                            for b in blocks:
+                                if not found_old:
+                                    if b == self._last_block:
+                                        found_old = True
+                                    continue
+                                new_blocks.append(b)
+
+                            if new_blocks:
+                                reply_text = "\n\n".join(new_blocks).strip()
+                                log.info("Reply detected (%d new blocks): %s",
+                                         len(new_blocks), reply_text[:100])
                                 if reply_text:
-                                    self._replied = True
+                                    self._waiting_for_reply = False
                                     try:
                                         await self.on_output(reply_text[-2000:])
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        log.error("Failed to send reply: %s", e)
 
+                        self._last_block = cur_last
                         self._last_content = frame
                 else:
                     buffer.append(line.rstrip("\n"))
@@ -393,11 +429,6 @@ async def handle_message(msg, send_fn):
                 await send_fn({"type": "text", "text": f"Usage: /focus <1-{len(instances)}>"})
                 return
 
-            # Stop previous watcher
-            if _active_watcher:
-                await _active_watcher.stop()
-                _active_watcher = None
-
             _focused_target = inst["target"]
             _focused_project = inst["project"]
             _focused_host = inst["host"]
@@ -413,15 +444,33 @@ async def handle_message(msg, send_fn):
             lines = cleaned.splitlines()[-3:] if cleaned else []
             await send_fn({"type": "text", "text": f"Focused on [{_focused_project}]\n" + "\n".join(lines)})
 
-            # Start persistent stream watcher for remote sessions
+            # Start or reuse persistent stream watcher for remote sessions
             if _focused_host and _focused_host != "__local__":
-                _active_watcher = RemoteStreamWatcher(
-                    _focused_host, _focused_target,
-                    on_output=lambda text: send_fn({"type": "text", "text": text}),
-                    interval=0.3,
-                )
-                await _active_watcher.start()
-                log.info("Started stream watcher for %s:%s", _focused_host, _focused_target)
+                if (_active_watcher and _active_watcher._running
+                        and _active_watcher.host == _focused_host
+                        and _active_watcher.session == _focused_target):
+                    # Same host+session: just update the send function
+                    _active_watcher.update_send_fn(
+                        lambda text: send_fn({"type": "text", "text": text})
+                    )
+                    log.info("Reused stream watcher for %s:%s (updated send_fn)",
+                             _focused_host, _focused_target)
+                else:
+                    # Different session or no watcher: stop old, create new
+                    if _active_watcher:
+                        await _active_watcher.stop()
+                    _active_watcher = RemoteStreamWatcher(
+                        _focused_host, _focused_target,
+                        on_output=lambda text: send_fn({"type": "text", "text": text}),
+                        interval=0.3,
+                    )
+                    await _active_watcher.start()
+                    log.info("Started stream watcher for %s:%s", _focused_host, _focused_target)
+            else:
+                # Switching to local/paste: stop remote watcher if any
+                if _active_watcher:
+                    await _active_watcher.stop()
+                    _active_watcher = None
             return
 
         elif cmd == "/unfocus":
@@ -533,7 +582,7 @@ async def handle_message(msg, send_fn):
         elif _focused_host:
             _remote_send_to_pane(_focused_host, _focused_target, f"[M] {text}")
             if _active_watcher:
-                _active_watcher.expect_reply(text)
+                _active_watcher.expect_reply()
         else:
             send_to_pane(_focused_target, f"[M] {text}")
         await send_fn({"type": "waiting", "text": "等待回复..."})
@@ -955,12 +1004,10 @@ def main():
                     await send_fn({"type": "text", "text": f"Error: {e}"})
         except WebSocketDisconnect:
             state["connected"] = False
-            # Keep focus state for reconnection, just stop watcher
-            global _active_watcher
-            if _active_watcher:
-                await _active_watcher.stop()
-                _active_watcher = None
-            log.info("Client disconnected")
+            # Keep focus state AND watcher alive for reconnection.
+            # The watcher's send_fn will be updated when client reconnects
+            # and sends /focus again.
+            log.info("Client disconnected (watcher kept alive for reconnect)")
 
     # Get the right IP for phone access
     import socket
